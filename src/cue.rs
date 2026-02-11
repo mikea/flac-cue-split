@@ -44,8 +44,7 @@ fn parse_cue_from_bytes(
     contents: &[u8],
     encoding: &'static Encoding,
 ) -> Result<(CueDisc, Vec<String>, &'static Encoding)> {
-    let cue_cstr =
-        CString::new(contents).map_err(|_| "cue file contains NUL byte".to_string())?;
+    let cue_cstr = CString::new(contents).map_err(|_| "cue file contains NUL byte".to_string())?;
     let capture = StderrCapture::start()?;
     let cd = unsafe { cue::cue_parse_string(cue_cstr.as_ptr()) };
     let stderr = capture.finish()?;
@@ -80,11 +79,7 @@ fn format_cue_warnings(warnings: &[String]) -> String {
     warnings.join("\n")
 }
 
-fn parse_cue_warnings(
-    stderr: &str,
-    contents: &[u8],
-    encoding: &'static Encoding,
-) -> Vec<String> {
+fn parse_cue_warnings(stderr: &str, contents: &[u8], encoding: &'static Encoding) -> Vec<String> {
     let (decoded, _, _) = encoding.decode(contents);
     let cue_lines: Vec<String> = decoded
         .lines()
@@ -175,7 +170,10 @@ unsafe fn parse_cd(cd: *mut cue::CdPointer, encoding: &'static Encoding) -> Resu
             return Err(format!("failed to read track {}", index));
         }
 
-        if !matches!(unsafe { cue::track_get_mode(track_ptr) }, cue::TrackMode::Audio) {
+        if !matches!(
+            unsafe { cue::track_get_mode(track_ptr) },
+            cue::TrackMode::Audio
+        ) {
             return Err(format!("track {} is not audio", index));
         }
 
@@ -258,7 +256,11 @@ fn cue_rem_from_ptr(rem: *mut cue::RemPointer, encoding: &'static Encoding) -> C
     }
 }
 
-fn rem_get_string(rem: *mut cue::RemPointer, key: u32, encoding: &'static Encoding) -> Option<String> {
+fn rem_get_string(
+    rem: *mut cue::RemPointer,
+    key: u32,
+    encoding: &'static Encoding,
+) -> Option<String> {
     if rem.is_null() {
         return None;
     }

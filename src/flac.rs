@@ -3,17 +3,17 @@ use indicatif::ProgressBar;
 use libflac_sys as flac;
 use owo_colors::OwoColorize;
 use std::collections::HashSet;
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 use crate::cli::InputPath;
 use crate::cue::{parse_cue_file, report_cue_warnings};
 use crate::metadata::{build_track_metadata, parse_vorbis_comment};
 use crate::output::{confirm_or_exit, finish_progress, make_progress_bar, print_plan};
 use crate::picture::add_external_picture;
 use crate::types::{CueDisc, CueRem, InputMetadata, TrackSpan};
-use crate::Result;
 
 pub(crate) struct SplitOptions {
     pub(crate) flac_input: InputPath,
@@ -25,6 +25,7 @@ pub(crate) struct SplitOptions {
     pub(crate) compression_level: u8,
     pub(crate) search_dir: PathBuf,
     pub(crate) picture_enabled: bool,
+    pub(crate) picture_path: Option<PathBuf>,
 }
 
 pub(crate) fn split_flac(options: SplitOptions) -> Result<()> {
@@ -101,7 +102,12 @@ pub(crate) fn split_flac(options: SplitOptions) -> Result<()> {
             .input_meta
             .as_mut()
             .ok_or_else(|| "missing input metadata".to_string())?;
-        add_external_picture(meta, &mut context.picture_names, &options.search_dir)?;
+        add_external_picture(
+            meta,
+            &mut context.picture_names,
+            &options.search_dir,
+            options.picture_path.as_deref(),
+        )?;
     }
 
     context.prepare_tracks(sample_rate, total_samples, false)?;
@@ -248,7 +254,12 @@ impl DecodeContext {
         }
     }
 
-    fn prepare_tracks(&mut self, sample_rate: u32, total_samples: u64, check_exists: bool) -> Result<()> {
+    fn prepare_tracks(
+        &mut self,
+        sample_rate: u32,
+        total_samples: u64,
+        check_exists: bool,
+    ) -> Result<()> {
         let tracks = compute_track_spans(&self.cue, sample_rate, total_samples)?;
         let output_paths = compute_output_paths(&tracks, &self.output_dir, check_exists)?;
         let mut spans = Vec::with_capacity(tracks.len());
@@ -396,10 +407,7 @@ pub(crate) fn compute_track_spans(
             return Err(format!("track {} has invalid length", track.number));
         }
         if total_samples > 0 && end > total_samples {
-            return Err(format!(
-                "track {} exceeds FLAC total samples",
-                track.number
-            ));
+            return Err(format!("track {} exceeds FLAC total samples", track.number));
         }
 
         tracks.push(ComputedTrack {
@@ -583,13 +591,12 @@ unsafe extern "C" fn decoder_write_callback(
         progress.inc(block_samples as u64);
     }
 
-    let mut block_start = if frame_ref.header.number_type
-        == flac::FLAC__FRAME_NUMBER_TYPE_SAMPLE_NUMBER
-    {
-        unsafe { frame_ref.header.number.sample_number }
-    } else {
-        ctx.next_sample_number
-    };
+    let mut block_start =
+        if frame_ref.header.number_type == flac::FLAC__FRAME_NUMBER_TYPE_SAMPLE_NUMBER {
+            unsafe { frame_ref.header.number.sample_number }
+        } else {
+            ctx.next_sample_number
+        };
     ctx.next_sample_number = block_start + block_samples as u64;
 
     let mut local_offset = 0usize;

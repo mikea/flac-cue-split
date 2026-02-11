@@ -4,10 +4,10 @@ use owo_colors::OwoColorize;
 use std::io::{self, Write};
 use std::path::Path;
 
+use crate::Result;
 use crate::cli::display_path;
 use crate::flac::DecodeContext;
 use crate::metadata::{compute_common_metadata, compute_unique_metadata_pairs};
-use crate::Result;
 
 pub(crate) fn print_plan(
     context: &DecodeContext,

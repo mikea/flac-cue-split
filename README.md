@@ -2,7 +2,7 @@
 
 Split a single FLAC into per-track FLAC files using a CUE sheet.
 
-## Usage
+## Installation
 
 Install dependencies:
 
@@ -15,6 +15,8 @@ Installation:
 ```bash
 cargo install --git https://github.com/mikea/flac-cue-split
 ```
+
+## Usage
 
 Run (auto-detects `.flac` and `.cue` in current directory):
 
@@ -53,6 +55,12 @@ flac-cue-split -c 8
 flac-cue-split --compression-level max
 ```
 
+Pick a specific picture file:
+
+```bash
+flac-cue-split --picture cover.jpg
+```
+
 Disable picture auto-detect:
 
 ```bash
@@ -71,7 +79,8 @@ flac-cue-split --cue-encoding windows-1251
 - Output files are written next to the input FLAC using the pattern `NN - Title.flac`.
 - The tool prints a plan, shared tags, and per-track unique tags, then asks for confirmation.
 - A progress bar is shown during encoding.
-- If there is exactly one image file in the chosen directory (jpg/jpeg/png/gif/bmp/webp/tif/tiff), it is embedded as a cover picture in all output files (unless `--no-picture` is used).
+- If `--picture <FILE>` is provided, that file is embedded as the cover image.
+- Otherwise, if there is exactly one image file in the chosen directory (jpg/jpeg/png/gif/bmp/webp/tif/tiff), it is embedded as a cover picture in all output files (unless `--no-picture` is used).
 - Cue encoding is auto-detected (UTF-8, otherwise Windows-1251) and shown in the plan. You can override it with `--cue-encoding`.
 
 ## Options
@@ -82,6 +91,6 @@ flac-cue-split --cue-encoding windows-1251
 - `-y, --yes`: Skip confirmation
 - `-o, --overwrite`: Overwrite existing output files
 - `-c, --compression-level <LEVEL>`: FLAC compression level (0-8 or `max`)
-- `--picture` / `--no-picture`: Enable/disable picture auto-detection (default: enabled)
+- `--picture <FILE>`: Use a specific picture file
+- `--no-picture`: Disable picture auto-detection
 - `DIR`: Optional directory to scan for input files
-

@@ -1,9 +1,9 @@
 use clap::Parser;
 
-use crate::cli::{resolve_input_path, Args};
-use crate::cue::resolve_encoding;
-use crate::flac::{split_flac, SplitOptions};
 use crate::Result;
+use crate::cli::{Args, resolve_input_path};
+use crate::cue::resolve_encoding;
+use crate::flac::{SplitOptions, split_flac};
 
 pub fn run() -> Result<()> {
     let args = Args::parse();
@@ -20,12 +20,33 @@ pub fn run() -> Result<()> {
         None => (cwd.clone(), Some(cwd)),
     };
 
-    let flac_input =
-        resolve_input_path(&base_dir_abs, display_base_abs.as_deref(), args.flac.as_ref(), "flac")?;
-    let cue_input =
-        resolve_input_path(&base_dir_abs, display_base_abs.as_deref(), args.cue.as_ref(), "cue")?;
+    let flac_input = resolve_input_path(
+        &base_dir_abs,
+        display_base_abs.as_deref(),
+        args.flac.as_ref(),
+        "flac",
+    )?;
+    let cue_input = resolve_input_path(
+        &base_dir_abs,
+        display_base_abs.as_deref(),
+        args.cue.as_ref(),
+        "cue",
+    )?;
 
-    let picture_enabled = if args.no_picture { false } else { args.picture };
+    let picture_enabled = !args.no_picture;
+    let picture_path = if let Some(path) = args.picture.as_ref() {
+        let abs = if path.is_absolute() {
+            path.clone()
+        } else {
+            base_dir_abs.join(path)
+        };
+        if !abs.is_file() {
+            return Err(format!("picture file not found: {}", abs.display()));
+        }
+        Some(abs)
+    } else {
+        None
+    };
 
     let options = SplitOptions {
         flac_input,
@@ -37,6 +58,7 @@ pub fn run() -> Result<()> {
         compression_level: args.compression_level,
         search_dir: base_dir_abs,
         picture_enabled,
+        picture_path,
     };
 
     split_flac(options)

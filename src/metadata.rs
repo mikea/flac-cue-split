@@ -84,9 +84,8 @@ fn append_comment(object: *mut flac::FLAC__StreamMetadata, key: &str, value: &st
         entry: bytes.as_ptr() as *mut flac::FLAC__byte,
     };
 
-    let ok = unsafe {
-        flac::FLAC__metadata_object_vorbiscomment_append_comment(object, entry, 1) != 0
-    };
+    let ok =
+        unsafe { flac::FLAC__metadata_object_vorbiscomment_append_comment(object, entry, 1) != 0 };
     if !ok {
         return Err(format!("failed to append Vorbis comment {}", key));
     }
@@ -215,7 +214,13 @@ pub(crate) fn compute_common_metadata(
 
     let mut common: Vec<(String, String)> = counts
         .into_iter()
-        .filter_map(|(pair, count)| if count == track_count { Some(pair) } else { None })
+        .filter_map(|(pair, count)| {
+            if count == track_count {
+                Some(pair)
+            } else {
+                None
+            }
+        })
         .collect();
     common.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     common

@@ -10,10 +10,14 @@ pub(crate) fn add_external_picture(
     meta: &mut InputMetadata,
     picture_names: &mut Vec<String>,
     search_dir: &Path,
+    explicit_path: Option<&Path>,
 ) -> Result<()> {
-    let picture_path = match find_picture_file(search_dir)? {
-        Some(path) => path,
-        None => return Ok(()),
+    let picture_path = match explicit_path {
+        Some(path) => path.to_path_buf(),
+        None => match find_picture_file(search_dir)? {
+            Some(path) => path,
+            None => return Ok(()),
+        },
     };
 
     let picture = load_picture_metadata(&picture_path)?;
@@ -75,8 +79,8 @@ fn load_picture_metadata(path: &Path) -> Result<*mut flac::FLAC__StreamMetadata>
         return Err("failed to allocate picture metadata".to_string());
     }
 
-    let mime_c = CString::new(mime)
-        .map_err(|_| format!("picture mime type contains NUL: {}", mime))?;
+    let mime_c =
+        CString::new(mime).map_err(|_| format!("picture mime type contains NUL: {}", mime))?;
     let desc_c = CString::new("").map_err(|_| "picture description contains NUL".to_string())?;
 
     unsafe {
@@ -89,8 +93,7 @@ fn load_picture_metadata(path: &Path) -> Result<*mut flac::FLAC__StreamMetadata>
     }
 
     let ok = unsafe {
-        flac::FLAC__metadata_object_picture_set_mime_type(object, mime_c.as_ptr() as *mut _, 1)
-            != 0
+        flac::FLAC__metadata_object_picture_set_mime_type(object, mime_c.as_ptr() as *mut _, 1) != 0
     };
     if !ok {
         unsafe {

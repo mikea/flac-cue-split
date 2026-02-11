@@ -20,9 +20,9 @@ pub(crate) struct Args {
     pub(crate) compression_level: u8,
     #[arg(value_name = "DIR")]
     pub(crate) dir: Option<PathBuf>,
-    #[arg(long, default_value_t = true)]
-    pub(crate) picture: bool,
-    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "picture")]
+    #[arg(long, value_name = "FILE")]
+    pub(crate) picture: Option<PathBuf>,
+    #[arg(long, conflicts_with = "picture")]
     pub(crate) no_picture: bool,
 }
 
