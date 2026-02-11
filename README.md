@@ -4,59 +4,65 @@ Split a single FLAC into per-track FLAC files using a CUE sheet.
 
 ## Usage
 
-Build:
+Install dependencies:
+
+```
+sudo apt install cmake bison flex
+```
+
+Installation:
 
 ```bash
-cargo build
+cargo install --git https://github.com/mikea/flac-cue-split
 ```
 
 Run (auto-detects `.flac` and `.cue` in current directory):
 
 ```bash
-./target/debug/flac-cue-split
+flac-cue-split
 ```
 
 Run with explicit files:
 
 ```bash
-./target/debug/flac-cue-split --flac "Album.flac" --cue "Album.cue"
+flac-cue-split --flac "Album.flac" --cue "Album.cue"
 ```
 
 Run in a different directory (positional `DIR`):
 
 ```bash
-./target/debug/flac-cue-split /path/to/album
+flac-cue-split /path/to/album
 ```
 
 Skip confirmation:
 
 ```bash
-./target/debug/flac-cue-split -y
+flac-cue-split -y
 ```
 
 Overwrite existing outputs:
 
 ```bash
-./target/debug/flac-cue-split -o
+flac-cue-split -o
 ```
 
 Set compression level (0-8 or `max`):
 
 ```bash
-./target/debug/flac-cue-split -c 8
-./target/debug/flac-cue-split --compression-level max
+flac-cue-split -c 8
+flac-cue-split --compression-level max
 ```
 
 Disable picture auto-detect:
 
 ```bash
-./target/debug/flac-cue-split --no-picture
+flac-cue-split --no-picture
 ```
 
 Force cue encoding:
 
 ```bash
-./target/debug/flac-cue-split --cue-encoding windows-1251
+flac-cue-split --cue-encoding windows-1251
 ```
 
 ## Behavior
