@@ -29,6 +29,10 @@ struct Args {
     compression_level: u8,
     #[arg(value_name = "DIR")]
     dir: Option<PathBuf>,
+    #[arg(long, default_value_t = true)]
+    picture: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "picture")]
+    no_picture: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -51,46 +55,61 @@ pub fn run() -> Result<()> {
     let cue_input =
         resolve_input_path(&base_dir_abs, display_base_abs.as_deref(), args.cue.as_ref(), "cue")?;
 
-    split_flac(
-        &flac_input,
-        &cue_input,
-        display_base_abs.as_deref(),
-        encoding,
-        args.yes,
-        args.overwrite,
-        args.compression_level,
-    )
+    let picture_enabled = if args.no_picture { false } else { args.picture };
+
+    let options = SplitOptions {
+        flac_input,
+        cue_input,
+        display_base_abs,
+        cue_encoding: encoding,
+        yes: args.yes,
+        overwrite: args.overwrite,
+        compression_level: args.compression_level,
+        search_dir: base_dir_abs,
+        picture_enabled,
+    };
+
+    split_flac(options)
 }
 
-fn split_flac(
-    flac_input: &InputPath,
-    cue_input: &InputPath,
-    display_base_abs: Option<&Path>,
+struct SplitOptions {
+    flac_input: InputPath,
+    cue_input: InputPath,
+    display_base_abs: Option<PathBuf>,
     cue_encoding: Option<&'static Encoding>,
     yes: bool,
     overwrite: bool,
     compression_level: u8,
-) -> Result<()> {
-    let (cue, warnings, encoding_used, encoding_autodetected) =
-        parse_cue_file(&cue_input.abs, cue_encoding)?;
-    report_cue_warnings(&warnings);
-    validate_cue_files(&cue, &flac_input.abs)?;
+    search_dir: PathBuf,
+    picture_enabled: bool,
+}
 
-    let output_dir = flac_input
+fn split_flac(options: SplitOptions) -> Result<()> {
+    let (cue, warnings, encoding_used, encoding_autodetected) =
+        parse_cue_file(&options.cue_input.abs, options.cue_encoding)?;
+    report_cue_warnings(&warnings);
+    validate_cue_files(&cue, &options.flac_input.abs)?;
+
+    let output_dir = options
+        .flac_input
         .abs
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut context =
-        DecodeContext::new(cue, output_dir, compression_level, display_base_abs.map(PathBuf::from));
+    let mut context = DecodeContext::new(
+        cue,
+        output_dir,
+        options.compression_level,
+        options.display_base_abs.clone(),
+    );
 
     let decoder = unsafe { flac::FLAC__stream_decoder_new() };
     if decoder.is_null() {
         return Err("failed to create FLAC decoder".to_string());
     }
 
-    let flac_path_c = path_to_cstring(&flac_input.abs)?;
+    let flac_path_c = path_to_cstring(&options.flac_input.abs)?;
     let init_status = unsafe {
         flac::FLAC__stream_decoder_set_metadata_respond_all(decoder);
         flac::FLAC__stream_decoder_init_file(
@@ -134,16 +153,19 @@ fn split_flac(
         (meta.sample_rate, meta.total_samples)
     };
 
+    if options.picture_enabled {
+        add_external_picture(&mut context, &options.search_dir)?;
+    }
+
     context.prepare_tracks(sample_rate, total_samples, false)?;
     print_plan(
         &context,
-        &flac_input.display,
-        &cue_input.display,
-        overwrite,
+        &options.flac_input.display,
+        &options.cue_input.display,
         encoding_used,
         encoding_autodetected,
     )?;
-    if !confirm_or_exit(yes)? {
+    if !confirm_or_exit(options.yes)? {
         unsafe {
             flac::FLAC__stream_decoder_finish(decoder);
             flac::FLAC__stream_decoder_delete(decoder);
@@ -155,7 +177,7 @@ fn split_flac(
     let progress = make_progress_bar(total_samples);
     context.progress = Some(progress.clone());
 
-    ensure_output_paths_available(&context.tracks, overwrite)?;
+    ensure_output_paths_available(&context.tracks, options.overwrite)?;
 
     let ok = unsafe { flac::FLAC__stream_decoder_process_until_end_of_stream(decoder) };
     if ok == 0 {
@@ -360,6 +382,160 @@ fn parse_compression_level(value: &str) -> Result<u8> {
     Ok(level)
 }
 
+fn add_external_picture(context: &mut DecodeContext, search_dir: &Path) -> Result<()> {
+    let picture_path = match find_picture_file(search_dir)? {
+        Some(path) => path,
+        None => return Ok(()),
+    };
+
+    let picture = load_picture_metadata(&picture_path)?;
+    let meta = context
+        .input_meta
+        .as_mut()
+        .ok_or_else(|| "missing input metadata".to_string())?;
+    meta.pictures.push(picture);
+    if let Some(name) = picture_path.file_name() {
+        context
+            .picture_names
+            .push(name.to_string_lossy().into_owned());
+    }
+    Ok(())
+}
+
+fn find_picture_file(dir: &Path) -> Result<Option<PathBuf>> {
+    let mut matches = Vec::new();
+    let read_dir = fs::read_dir(dir)
+        .map_err(|err| format!("failed to read directory {}: {}", dir.display(), err))?;
+    for entry in read_dir {
+        let entry = entry.map_err(|err| format!("failed to read directory entry: {}", err))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = match path.extension().and_then(|ext| ext.to_str()) {
+            Some(ext) => ext.to_ascii_lowercase(),
+            None => continue,
+        };
+        if matches_picture_extension(&ext) {
+            matches.push(path);
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches.remove(0))),
+        _ => Err(format!(
+            "multiple picture files found in {}, use --no-picture or keep one",
+            dir.display()
+        )),
+    }
+}
+
+fn matches_picture_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tif" | "tiff"
+    )
+}
+
+fn load_picture_metadata(path: &Path) -> Result<*mut flac::FLAC__StreamMetadata> {
+    let data = fs::read(path)
+        .map_err(|err| format!("failed to read picture {}: {}", path.display(), err))?;
+    if data.is_empty() {
+        return Err(format!("picture {} is empty", path.display()));
+    }
+
+    let mime = picture_mime_type(path)
+        .ok_or_else(|| format!("unsupported picture type: {}", path.display()))?;
+
+    let object = unsafe { flac::FLAC__metadata_object_new(flac::FLAC__METADATA_TYPE_PICTURE) };
+    if object.is_null() {
+        return Err("failed to allocate picture metadata".to_string());
+    }
+
+    let mime_c = CString::new(mime)
+        .map_err(|_| format!("picture mime type contains NUL: {}", mime))?;
+    let desc_c = CString::new("").map_err(|_| "picture description contains NUL".to_string())?;
+
+    unsafe {
+        let picture = &mut (*object).data.picture;
+        picture.type_ = flac::FLAC__STREAM_METADATA_PICTURE_TYPE_FRONT_COVER;
+        picture.width = 0;
+        picture.height = 0;
+        picture.depth = 0;
+        picture.colors = 0;
+    }
+
+    let ok = unsafe {
+        flac::FLAC__metadata_object_picture_set_mime_type(object, mime_c.as_ptr() as *mut _, 1)
+            != 0
+    };
+    if !ok {
+        unsafe {
+            flac::FLAC__metadata_object_delete(object);
+        }
+        return Err("failed to set picture mime type".to_string());
+    }
+
+    let ok = unsafe {
+        flac::FLAC__metadata_object_picture_set_description(
+            object,
+            desc_c.as_ptr() as *mut flac::FLAC__byte,
+            1,
+        ) != 0
+    };
+    if !ok {
+        unsafe {
+            flac::FLAC__metadata_object_delete(object);
+        }
+        return Err("failed to set picture description".to_string());
+    }
+
+    let ok = unsafe {
+        flac::FLAC__metadata_object_picture_set_data(
+            object,
+            data.as_ptr() as *mut flac::FLAC__byte,
+            data.len() as u32,
+            1,
+        ) != 0
+    };
+    if !ok {
+        unsafe {
+            flac::FLAC__metadata_object_delete(object);
+        }
+        return Err("failed to set picture data".to_string());
+    }
+
+    let mut violation: *const i8 = std::ptr::null();
+    let ok = unsafe { flac::FLAC__metadata_object_picture_is_legal(object, &mut violation) != 0 };
+    if !ok {
+        let msg = if violation.is_null() {
+            "picture metadata is invalid".to_string()
+        } else {
+            unsafe { CStr::from_ptr(violation).to_string_lossy().into_owned() }
+        };
+        unsafe {
+            flac::FLAC__metadata_object_delete(object);
+        }
+        return Err(msg);
+    }
+
+    Ok(object)
+}
+
+fn picture_mime_type(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "bmp" => Some("image/bmp"),
+        "webp" => Some("image/webp"),
+        "tif" | "tiff" => Some("image/tiff"),
+        _ => None,
+    }
+}
+
 fn resolve_or_find_file(
     base_dir: &Path,
     provided: Option<&PathBuf>,
@@ -441,14 +617,13 @@ fn resolve_input_path(
 }
 
 fn display_path(base: Option<&Path>, path: &Path) -> PathBuf {
-    if let Some(base) = base {
-        if let Ok(rel) = path.strip_prefix(base) {
+    if let Some(base) = base
+        && let Ok(rel) = path.strip_prefix(base) {
             if rel.as_os_str().is_empty() {
                 return PathBuf::from(".");
             }
             return rel.to_path_buf();
         }
-    }
     path.to_path_buf()
 }
 
@@ -763,6 +938,7 @@ struct DecodeContext {
     progress: Option<ProgressBar>,
     compression_level: u8,
     display_base_abs: Option<PathBuf>,
+    picture_names: Vec<String>,
 }
 
 impl DecodeContext {
@@ -785,6 +961,7 @@ impl DecodeContext {
             progress: None,
             compression_level,
             display_base_abs,
+            picture_names: Vec::new(),
         }
     }
 
@@ -1031,7 +1208,6 @@ fn print_plan(
     context: &DecodeContext,
     flac_path: &Path,
     cue_path: &Path,
-    overwrite: bool,
     cue_encoding: &'static Encoding,
     cue_encoding_autodetected: bool,
 ) -> Result<()> {
@@ -1071,57 +1247,49 @@ fn print_plan(
     );
     let common_metadata = compute_common_metadata(context);
     let picture_count = meta.pictures.len();
-    print_shared_metadata(&common_metadata, picture_count);
+    print_shared_metadata(&common_metadata, picture_count, &context.picture_names);
 
     for track in &context.tracks {
         let start_frames = track.start / samples_per_frame;
         let end_frames = track.end / samples_per_frame;
         let length_frames = end_frames.saturating_sub(start_frames);
-        let duration_secs = (track.end - track.start) as f64 / meta.sample_rate as f64;
-
-        let title = track
-            .title
-            .clone()
-            .unwrap_or_else(|| format!("Track {}", track.number));
-        let exists = track.output_path.exists();
-        let exists_note = if exists && overwrite {
-            " (will overwrite)"
-        } else if exists {
-            " (exists)"
-        } else {
-            ""
-        };
 
         let output_display = display_path(context.display_base_abs.as_deref(), &track.output_path);
-        println!(
-            "{} {} -> {}{}",
-            format!("{:02}.", track.number).bold(),
-            title,
-            output_display.display(),
-            exists_note
-        );
-        println!(
-            "    {} {} {} {} {} {} ({:.3}s)",
-            "start".dimmed(),
-            format_msf(start_frames),
-            "end".dimmed(),
-            format_msf(end_frames),
-            "length".dimmed(),
-            format_msf(length_frames),
-            duration_secs
-        );
-        let unique_metadata = compute_unique_metadata(context, track, &common_metadata, picture_count);
-        if !unique_metadata.is_empty() {
-            println!("    {}", unique_metadata);
+        let file_name = output_display
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| output_display.display().to_string());
+        let length = format_msf(length_frames);
+        let range = format!("({}-{})", format_msf(start_frames), format_msf(end_frames));
+        let unique_metadata =
+            compute_unique_metadata_pairs(context, track, &common_metadata, picture_count);
+        let tags = format_tag_pairs(&unique_metadata);
+        if tags.is_empty() {
+            println!(
+                "{} {}",
+                file_name.bold(),
+                format!("{} {}", length, range).dimmed()
+            );
+        } else {
+            println!(
+                "{} {} {}",
+                file_name.bold(),
+                format!("{} {}", length, range).dimmed(),
+                tags
+            );
         }
     }
 
     Ok(())
 }
 
-fn print_shared_metadata(common: &[(String, String)], pictures: usize) {
+fn print_shared_metadata(
+    common: &[(String, String)],
+    pictures: usize,
+    picture_names: &[String],
+) {
     println!("{}", "Shared tags".bold());
-    let line = format_metadata_line(common, pictures);
+    let line = format_metadata_line(common, pictures, picture_names);
     if line.is_empty() {
         println!("  {}", "(none)".dimmed());
     } else {
@@ -1129,26 +1297,42 @@ fn print_shared_metadata(common: &[(String, String)], pictures: usize) {
     }
 }
 
-fn format_metadata_line(common: &[(String, String)], pictures: usize) -> String {
+fn format_metadata_line(
+    common: &[(String, String)],
+    pictures: usize,
+    picture_names: &[String],
+) -> String {
     let mut parts = Vec::new();
     for (key, value) in common {
-        parts.push(format!("{}={}", key, value));
+        parts.push(format!("{}={}", key.cyan(), value.yellow()));
     }
     if pictures > 0 {
-        parts.push(format!("PICTURES={}", pictures));
+        let picture_value = if picture_names.is_empty() {
+            pictures.to_string()
+        } else {
+            let mut value = picture_names.join(", ");
+            if pictures > picture_names.len() {
+                value.push_str(&format!(
+                    " (+{} embedded)",
+                    pictures - picture_names.len()
+                ));
+            }
+            value
+        };
+        parts.push(format!("{}={}", "PICTURES".cyan(), picture_value.yellow()));
     }
     parts.join("; ")
 }
 
-fn compute_unique_metadata(
+fn compute_unique_metadata_pairs(
     context: &DecodeContext,
     track: &TrackSpan,
     common: &[(String, String)],
-    pictures: usize,
-) -> String {
+    _pictures: usize,
+) -> Vec<(String, String)> {
     let meta = match context.input_meta.as_ref() {
         Some(meta) => meta,
-        None => return String::new(),
+        None => return Vec::new(),
     };
 
     let overrides = build_override_tags(context, track);
@@ -1161,13 +1345,14 @@ fn compute_unique_metadata(
         }
     }
 
-    let mut parts = Vec::new();
     unique.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    for (key, value) in unique {
-        parts.push(format!("{}={}", key, value));
-    }
-    if pictures == 0 {
-        // nothing
+    unique
+}
+
+fn format_tag_pairs(pairs: &[(String, String)]) -> String {
+    let mut parts = Vec::new();
+    for (key, value) in pairs {
+        parts.push(format!("{}={}", key.cyan(), value.yellow()));
     }
     parts.join("; ")
 }
