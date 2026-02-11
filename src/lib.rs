@@ -5,7 +5,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use libc::{c_int, c_void as libc_void};
 use libflac_sys as flac;
 use owo_colors::OwoColorize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1069,6 +1069,9 @@ fn print_plan(
         meta.bits_per_sample,
         context.compression_level
     );
+    let common_metadata = compute_common_metadata(context);
+    let picture_count = meta.pictures.len();
+    print_shared_metadata(&common_metadata, picture_count);
 
     for track in &context.tracks {
         let start_frames = track.start / samples_per_frame;
@@ -1107,9 +1110,66 @@ fn print_plan(
             format_msf(length_frames),
             duration_secs
         );
+        let unique_metadata = compute_unique_metadata(context, track, &common_metadata, picture_count);
+        if !unique_metadata.is_empty() {
+            println!("    {}", unique_metadata);
+        }
     }
 
     Ok(())
+}
+
+fn print_shared_metadata(common: &[(String, String)], pictures: usize) {
+    println!("{}", "Shared tags".bold());
+    let line = format_metadata_line(common, pictures);
+    if line.is_empty() {
+        println!("  {}", "(none)".dimmed());
+    } else {
+        println!("  {}", line);
+    }
+}
+
+fn format_metadata_line(common: &[(String, String)], pictures: usize) -> String {
+    let mut parts = Vec::new();
+    for (key, value) in common {
+        parts.push(format!("{}={}", key, value));
+    }
+    if pictures > 0 {
+        parts.push(format!("PICTURES={}", pictures));
+    }
+    parts.join("; ")
+}
+
+fn compute_unique_metadata(
+    context: &DecodeContext,
+    track: &TrackSpan,
+    common: &[(String, String)],
+    pictures: usize,
+) -> String {
+    let meta = match context.input_meta.as_ref() {
+        Some(meta) => meta,
+        None => return String::new(),
+    };
+
+    let overrides = build_override_tags(context, track);
+    let merged = merge_tags(&meta.comments, &overrides);
+    let mut unique: Vec<(String, String)> = Vec::new();
+    let common_set: HashSet<(String, String)> = common.iter().cloned().collect();
+    for pair in merged {
+        if !common_set.contains(&pair) {
+            unique.push(pair);
+        }
+    }
+
+    let mut parts = Vec::new();
+    unique.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    for (key, value) in unique {
+        parts.push(format!("{}={}", key, value));
+    }
+    if pictures == 0 {
+        // nothing
+    }
+    parts.join("; ")
 }
 
 fn make_progress_bar(total_samples: u64) -> ProgressBar {
@@ -1670,6 +1730,39 @@ fn merge_tags(base: &[(String, String)], overrides: &[(String, String)]) -> Vec<
 
     merged.extend(overrides.iter().cloned());
     merged
+}
+
+fn compute_common_metadata(context: &DecodeContext) -> Vec<(String, String)> {
+    let meta = match context.input_meta.as_ref() {
+        Some(meta) => meta,
+        None => return Vec::new(),
+    };
+
+    if context.tracks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    let track_count = context.tracks.len();
+
+    for track in &context.tracks {
+        let overrides = build_override_tags(context, track);
+        let merged = merge_tags(&meta.comments, &overrides);
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        for pair in merged {
+            seen.insert(pair);
+        }
+        for pair in seen {
+            *counts.entry(pair).or_insert(0) += 1;
+        }
+    }
+
+    let mut common: Vec<(String, String)> = counts
+        .into_iter()
+        .filter_map(|(pair, count)| if count == track_count { Some(pair) } else { None })
+        .collect();
+    common.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    common
 }
 
 fn parse_vorbis_comment(
