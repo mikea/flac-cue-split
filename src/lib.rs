@@ -4,6 +4,7 @@ use encoding_rs::{Encoding, UTF_8, WINDOWS_1251};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use libc::{c_int, c_void as libc_void};
 use libflac_sys as flac;
+use owo_colors::OwoColorize;
 use std::collections::HashSet;
 use std::ffi::{c_void, CStr, CString};
 use std::fs;
@@ -70,7 +71,8 @@ fn split_flac(
     overwrite: bool,
     compression_level: u8,
 ) -> Result<()> {
-    let (cue, warnings) = parse_cue_file(&cue_input.abs, cue_encoding)?;
+    let (cue, warnings, encoding_used, encoding_autodetected) =
+        parse_cue_file(&cue_input.abs, cue_encoding)?;
     report_cue_warnings(&warnings);
     validate_cue_files(&cue, &flac_input.abs)?;
 
@@ -138,6 +140,8 @@ fn split_flac(
         &flac_input.display,
         &cue_input.display,
         overwrite,
+        encoding_used,
+        encoding_autodetected,
     )?;
     if !confirm_or_exit(yes)? {
         unsafe {
@@ -231,23 +235,27 @@ struct CueTrack {
 fn parse_cue_file(
     path: &Path,
     encoding: Option<&'static Encoding>,
-) -> Result<(CueDisc, Vec<String>)> {
+) -> Result<(CueDisc, Vec<String>, &'static Encoding, bool)> {
     let contents = fs::read(path)
         .map_err(|err| format!("failed to read cue file {}: {}", path.display(), err))?;
-    let encoding = encoding.unwrap_or_else(|| detect_cue_encoding(&contents));
+    let (encoding, autodetected) = match encoding {
+        Some(enc) => (enc, false),
+        None => (detect_cue_encoding(&contents), true),
+    };
     parse_cue_from_bytes(&contents, encoding)
+        .map(|(disc, warnings, used, _)| (disc, warnings, used, autodetected))
 }
 
 #[cfg(test)]
 fn parse_cue_from_str(contents: &str) -> Result<CueDisc> {
-    let (disc, _) = parse_cue_from_bytes(contents.as_bytes(), UTF_8)?;
+    let (disc, _, _, _) = parse_cue_from_bytes(contents.as_bytes(), UTF_8)?;
     Ok(disc)
 }
 
 fn parse_cue_from_bytes(
     contents: &[u8],
     encoding: &'static Encoding,
-) -> Result<(CueDisc, Vec<String>)> {
+) -> Result<(CueDisc, Vec<String>, &'static Encoding, bool)> {
     let cue_cstr =
         CString::new(contents).map_err(|_| "cue file contains NUL byte".to_string())?;
     let capture = StderrCapture::start()?;
@@ -268,12 +276,12 @@ fn parse_cue_from_bytes(
     unsafe {
         cue::cd_delete(cd);
     }
-    result.map(|disc| (disc, warnings))
+    result.map(|disc| (disc, warnings, encoding, false))
 }
 
 fn report_cue_warnings(warnings: &[String]) {
     for warning in warnings {
-        eprintln!("{}", warning);
+        eprintln!("{}", warning.yellow());
     }
 }
 
@@ -294,6 +302,11 @@ fn parse_cue_warnings(
         .lines()
         .map(|line| line.trim_end_matches('\r').to_string())
         .collect();
+    let total_lines = if contents.is_empty() {
+        0usize
+    } else {
+        contents.iter().filter(|byte| **byte == b'\n').count() + 1
+    };
 
     let mut warnings = Vec::new();
     for raw in stderr.lines() {
@@ -310,6 +323,11 @@ fn parse_cue_warnings(
                     warning.push_str("    ");
                     warning.push_str(source);
                 }
+            } else if total_lines > 0 {
+                warning.push_str(&format!(
+                    " (line out of range; file has {} lines)",
+                    total_lines
+                ));
             }
             warnings.push(warning);
         } else {
@@ -717,7 +735,7 @@ impl InputMetadata {
         }
     }
 }
-
+    
 #[derive(Debug, Clone)]
 struct TrackSpan {
     number: u32,
@@ -1014,6 +1032,8 @@ fn print_plan(
     flac_path: &Path,
     cue_path: &Path,
     overwrite: bool,
+    cue_encoding: &'static Encoding,
+    cue_encoding_autodetected: bool,
 ) -> Result<()> {
     let meta = context
         .input_meta
@@ -1031,11 +1051,18 @@ fn print_plan(
 
     let samples_per_frame = (meta.sample_rate / 75) as u64;
 
-    println!("Plan");
-    println!("  FLAC: {}", flac_path.display());
-    println!("  CUE:  {}", cue_path.display());
+    println!("{}", "Plan".bold());
+    println!("  {} {}", "FLAC:".cyan(), flac_path.display());
+    println!("  {} {}", "CUE:".cyan(), cue_path.display());
+    let encoding_label = if cue_encoding_autodetected {
+        format!("{} {}", cue_encoding.name(), "(autodetected)".dimmed())
+    } else {
+        cue_encoding.name().to_string()
+    };
+    println!("  {} {}", "CUE encoding:".cyan(), encoding_label.green());
     println!(
-        "  Tracks: {} ({} Hz, {} ch, {} bits, compression {})",
+        "  {} {} ({} Hz, {} ch, {} bits, compression {})",
+        "Tracks:".cyan(),
         context.tracks.len(),
         meta.sample_rate,
         meta.channels,
@@ -1064,16 +1091,19 @@ fn print_plan(
 
         let output_display = display_path(context.display_base_abs.as_deref(), &track.output_path);
         println!(
-            "{:02}. {} -> {}{}",
-            track.number,
+            "{} {} -> {}{}",
+            format!("{:02}.", track.number).bold(),
             title,
             output_display.display(),
             exists_note
         );
         println!(
-            "    start {} end {} length {} ({:.3}s)",
+            "    {} {} {} {} {} {} ({:.3}s)",
+            "start".dimmed(),
             format_msf(start_frames),
+            "end".dimmed(),
             format_msf(end_frames),
+            "length".dimmed(),
             format_msf(length_frames),
             duration_secs
         );
@@ -1425,7 +1455,8 @@ fn announce_track_start(ctx: &DecodeContext, track: &TrackSpan) {
         .clone()
         .unwrap_or_else(|| format!("Track {}", track.number));
     let line = format!(
-        "Creating {:02} - {} -> {}",
+        "{} {:02} - {} -> {}",
+        "Creating".green().bold(),
         track.number,
         title,
         display_path(ctx.display_base_abs.as_deref(), &track.output_path).display()
