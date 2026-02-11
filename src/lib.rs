@@ -1,6 +1,7 @@
 use clap::Parser;
 use cue_sys as cue;
 use encoding_rs::{Encoding, UTF_8, WINDOWS_1251};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use libc::{c_int, c_void as libc_void};
 use libflac_sys as flac;
 use std::collections::HashSet;
@@ -19,8 +20,12 @@ struct Args {
     cue: PathBuf,
     #[arg(long, value_name = "ENCODING")]
     cue_encoding: Option<String>,
-    #[arg(long)]
-    dry_run: bool,
+    #[arg(short = 'y', long)]
+    yes: bool,
+    #[arg(short = 'o', long)]
+    overwrite: bool,
+    #[arg(short = 'c', long, default_value_t = 5, value_parser = parse_compression_level)]
+    compression_level: u8,
 }
 
 pub fn run() -> Result<()> {
@@ -29,14 +34,23 @@ pub fn run() -> Result<()> {
         Some(label) => Some(resolve_encoding(&label)?),
         None => None,
     };
-    split_flac(&args.flac, &args.cue, encoding, args.dry_run)
+    split_flac(
+        &args.flac,
+        &args.cue,
+        encoding,
+        args.yes,
+        args.overwrite,
+        args.compression_level,
+    )
 }
 
 fn split_flac(
     flac_path: &Path,
     cue_path: &Path,
     cue_encoding: Option<&'static Encoding>,
-    dry_run: bool,
+    yes: bool,
+    overwrite: bool,
+    compression_level: u8,
 ) -> Result<()> {
     let (cue, warnings) = parse_cue_file(cue_path, cue_encoding)?;
     report_cue_warnings(&warnings);
@@ -47,7 +61,7 @@ fn split_flac(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut context = DecodeContext::new(cue, output_dir);
+    let mut context = DecodeContext::new(cue, output_dir, compression_level);
 
     let decoder = unsafe { flac::FLAC__stream_decoder_new() };
     if decoder.is_null() {
@@ -98,10 +112,9 @@ fn split_flac(
         (meta.sample_rate, meta.total_samples)
     };
 
-    context.prepare_tracks(sample_rate, total_samples, !dry_run)?;
-
-    if dry_run {
-        print_dry_run(&context, flac_path, cue_path)?;
+    context.prepare_tracks(sample_rate, total_samples, false)?;
+    print_plan(&context, flac_path, cue_path, overwrite)?;
+    if !confirm_or_exit(yes)? {
         unsafe {
             flac::FLAC__stream_decoder_finish(decoder);
             flac::FLAC__stream_decoder_delete(decoder);
@@ -110,12 +123,18 @@ fn split_flac(
         return Ok(());
     }
 
+    let progress = make_progress_bar(total_samples);
+    context.progress = Some(progress.clone());
+
+    ensure_output_paths_available(&context.tracks, overwrite)?;
+
     let ok = unsafe { flac::FLAC__stream_decoder_process_until_end_of_stream(decoder) };
     if ok == 0 {
         let error = context
             .error
             .take()
             .unwrap_or_else(|| "FLAC decoding failed".to_string());
+        finish_progress(&mut context, "aborted");
         unsafe {
             flac::FLAC__stream_decoder_finish(decoder);
             flac::FLAC__stream_decoder_delete(decoder);
@@ -124,6 +143,7 @@ fn split_flac(
     }
 
     if let Err(error) = context.finish_encoder() {
+        finish_progress(&mut context, "aborted");
         unsafe {
             flac::FLAC__stream_decoder_finish(decoder);
             flac::FLAC__stream_decoder_delete(decoder);
@@ -136,6 +156,7 @@ fn split_flac(
         flac::FLAC__stream_decoder_delete(decoder);
     }
 
+    finish_progress(&mut context, "done");
     context.cleanup();
     Ok(())
 }
@@ -185,7 +206,7 @@ struct CueTrack {
 fn parse_cue_file(
     path: &Path,
     encoding: Option<&'static Encoding>,
-) -> Result<(CueDisc, Vec<CueParseWarning>)> {
+) -> Result<(CueDisc, Vec<String>)> {
     let contents = fs::read(path)
         .map_err(|err| format!("failed to read cue file {}: {}", path.display(), err))?;
     let encoding = encoding.unwrap_or_else(|| detect_cue_encoding(&contents));
@@ -201,7 +222,7 @@ fn parse_cue_from_str(contents: &str) -> Result<CueDisc> {
 fn parse_cue_from_bytes(
     contents: &[u8],
     encoding: &'static Encoding,
-) -> Result<(CueDisc, Vec<CueParseWarning>)> {
+) -> Result<(CueDisc, Vec<String>)> {
     let cue_cstr =
         CString::new(contents).map_err(|_| "cue file contains NUL byte".to_string())?;
     let capture = StderrCapture::start()?;
@@ -223,6 +244,146 @@ fn parse_cue_from_bytes(
         cue::cd_delete(cd);
     }
     result.map(|disc| (disc, warnings))
+}
+
+fn report_cue_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("{}", warning);
+    }
+}
+
+fn format_cue_warnings(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    warnings.join("\n")
+}
+
+fn parse_cue_warnings(
+    stderr: &str,
+    contents: &[u8],
+    encoding: &'static Encoding,
+) -> Vec<String> {
+    let (decoded, _, _) = encoding.decode(contents);
+    let cue_lines: Vec<String> = decoded
+        .lines()
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .collect();
+
+    let mut warnings = Vec::new();
+    for raw in stderr.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some((num, message)) = parse_cue_warning_line(line) {
+            let mut warning = format!("cue parse: line {}: {}", num, message);
+            if let Some(source) = cue_lines.get(num.saturating_sub(1) as usize) {
+                if !source.trim().is_empty() {
+                    warning.push('\n');
+                    warning.push_str("    ");
+                    warning.push_str(source);
+                }
+            }
+            warnings.push(warning);
+        } else {
+            warnings.push(format!("cue parse: {}", line));
+        }
+    }
+
+    warnings
+}
+
+fn parse_cue_warning_line(line: &str) -> Option<(u32, String)> {
+    let mut parts = line.splitn(2, ':');
+    let num_part = parts.next()?.trim();
+    let message = parts.next()?.trim();
+    let num: u32 = num_part.parse().ok()?;
+    Some((num, message.to_string()))
+}
+
+fn parse_compression_level(value: &str) -> Result<u8> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("max") {
+        return Ok(8);
+    }
+    let level: u8 = trimmed
+        .parse()
+        .map_err(|_| "compression level must be 0-8 or 'max'".to_string())?;
+    if level > 8 {
+        return Err("compression level must be 0-8 or 'max'".to_string());
+    }
+    Ok(level)
+}
+
+struct StderrCapture {
+    read_fd: c_int,
+    old_fd: c_int,
+}
+
+impl StderrCapture {
+    fn start() -> Result<Self> {
+        let mut fds = [0; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if rc != 0 {
+            return Err("failed to create pipe for stderr capture".to_string());
+        }
+
+        let old_fd = unsafe { libc::dup(libc::STDERR_FILENO) };
+        if old_fd == -1 {
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err("failed to dup stderr".to_string());
+        }
+
+        let rc = unsafe { libc::dup2(fds[1], libc::STDERR_FILENO) };
+        unsafe {
+            libc::close(fds[1]);
+        }
+        if rc == -1 {
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(old_fd);
+            }
+            return Err("failed to redirect stderr".to_string());
+        }
+
+        Ok(Self {
+            read_fd: fds[0],
+            old_fd,
+        })
+    }
+
+    fn finish(self) -> Result<String> {
+        unsafe {
+            libc::dup2(self.old_fd, libc::STDERR_FILENO);
+            libc::close(self.old_fd);
+        }
+
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = unsafe {
+                libc::read(
+                    self.read_fd,
+                    chunk.as_mut_ptr() as *mut libc_void,
+                    chunk.len(),
+                )
+            };
+            if read <= 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read as usize]);
+        }
+        unsafe {
+            libc::close(self.read_fd);
+        }
+
+        Ok(String::from_utf8_lossy(&buffer).into_owned())
+    }
 }
 
 unsafe fn parse_cd(cd: *mut cue::CdPointer, encoding: &'static Encoding) -> Result<CueDisc> {
@@ -464,10 +625,12 @@ struct DecodeContext {
     interleaved: Vec<i32>,
     error: Option<String>,
     next_sample_number: u64,
+    progress: Option<ProgressBar>,
+    compression_level: u8,
 }
 
 impl DecodeContext {
-    fn new(cue: CueDisc, output_dir: PathBuf) -> Self {
+    fn new(cue: CueDisc, output_dir: PathBuf, compression_level: u8) -> Self {
         Self {
             cue,
             output_dir,
@@ -478,6 +641,8 @@ impl DecodeContext {
             interleaved: Vec::new(),
             error: None,
             next_sample_number: 0,
+            progress: None,
+            compression_level,
         }
     }
 
@@ -720,7 +885,12 @@ fn sanitize_filename(value: &str) -> String {
     out.trim().to_string()
 }
 
-fn print_dry_run(context: &DecodeContext, flac_path: &Path, cue_path: &Path) -> Result<()> {
+fn print_plan(
+    context: &DecodeContext,
+    flac_path: &Path,
+    cue_path: &Path,
+    overwrite: bool,
+) -> Result<()> {
     let meta = context
         .input_meta
         .as_ref()
@@ -737,15 +907,16 @@ fn print_dry_run(context: &DecodeContext, flac_path: &Path, cue_path: &Path) -> 
 
     let samples_per_frame = (meta.sample_rate / 75) as u64;
 
-    println!("Dry run");
+    println!("Plan");
     println!("  FLAC: {}", flac_path.display());
     println!("  CUE:  {}", cue_path.display());
     println!(
-        "  Tracks: {} ({} Hz, {} ch, {} bits)",
+        "  Tracks: {} ({} Hz, {} ch, {} bits, compression {})",
         context.tracks.len(),
         meta.sample_rate,
         meta.channels,
-        meta.bits_per_sample
+        meta.bits_per_sample,
+        context.compression_level
     );
 
     for track in &context.tracks {
@@ -759,13 +930,20 @@ fn print_dry_run(context: &DecodeContext, flac_path: &Path, cue_path: &Path) -> 
             .clone()
             .unwrap_or_else(|| format!("Track {}", track.number));
         let exists = track.output_path.exists();
+        let exists_note = if exists && overwrite {
+            " (will overwrite)"
+        } else if exists {
+            " (exists)"
+        } else {
+            ""
+        };
 
         println!(
             "{:02}. {} -> {}{}",
             track.number,
             title,
             track.output_path.display(),
-            if exists { " (exists)" } else { "" }
+            exists_note
         );
         println!(
             "    start {} end {} length {} ({:.3}s)",
@@ -776,6 +954,76 @@ fn print_dry_run(context: &DecodeContext, flac_path: &Path, cue_path: &Path) -> 
         );
     }
 
+    Ok(())
+}
+
+fn make_progress_bar(total_samples: u64) -> ProgressBar {
+    if total_samples > 0 {
+        let pb = ProgressBar::with_draw_target(
+            Some(total_samples),
+            ProgressDrawTarget::stderr_with_hz(10),
+        );
+        let style = ProgressStyle::with_template(
+            "{bar:60.cyan/blue} {percent:>3}% {pos:>10}/{len:<10} {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-");
+        pb.set_style(style);
+        pb.set_message("decoding");
+        pb
+    } else {
+        let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(10));
+        pb.set_message("decoding");
+        pb.enable_steady_tick(std::time::Duration::from_millis(120));
+        pb
+    }
+}
+
+fn finish_progress(context: &mut DecodeContext, message: &str) {
+    if let Some(pb) = context.progress.take() {
+        pb.finish_with_message(message.to_string());
+    }
+}
+
+fn confirm_or_exit(yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    use std::io::{self, Write};
+
+    print!("Proceed? [y/N]: ");
+    io::stdout()
+        .flush()
+        .map_err(|err| format!("failed to flush stdout: {}", err))?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| format!("failed to read confirmation: {}", err))?;
+
+    let answer = input.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
+fn ensure_output_paths_available(tracks: &[TrackSpan], overwrite: bool) -> Result<()> {
+    for track in tracks {
+        if track.output_path.exists() {
+            if overwrite {
+                fs::remove_file(&track.output_path).map_err(|err| {
+                    format!(
+                        "failed to remove existing file {}: {}",
+                        track.output_path.display(),
+                        err
+                    )
+                })?;
+            } else {
+                return Err(format!(
+                    "output file already exists: {}",
+                    track.output_path.display()
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -856,6 +1104,9 @@ unsafe extern "C" fn decoder_write_callback(
     let block_samples = frame_ref.header.blocksize as usize;
     if block_samples == 0 {
         return flac::FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+    }
+    if let Some(progress) = ctx.progress.as_ref() {
+        progress.inc(block_samples as u64);
     }
 
     let mut block_start = if frame_ref.header.number_type
@@ -981,7 +1232,10 @@ fn start_track_encoder(ctx: &DecodeContext, track: &TrackSpan) -> Result<TrackEn
         flac::FLAC__stream_encoder_set_channels(encoder, meta.channels) != 0
             && flac::FLAC__stream_encoder_set_bits_per_sample(encoder, meta.bits_per_sample) != 0
             && flac::FLAC__stream_encoder_set_sample_rate(encoder, meta.sample_rate) != 0
-            && flac::FLAC__stream_encoder_set_compression_level(encoder, 5) != 0
+            && flac::FLAC__stream_encoder_set_compression_level(
+                encoder,
+                ctx.compression_level as u32,
+            ) != 0
     };
     if !ok {
         unsafe {
@@ -1035,7 +1289,27 @@ fn start_track_encoder(ctx: &DecodeContext, track: &TrackSpan) -> Result<TrackEn
         ));
     }
 
+    announce_track_start(ctx, track);
+
     Ok(TrackEncoder { encoder })
+}
+
+fn announce_track_start(ctx: &DecodeContext, track: &TrackSpan) {
+    let title = track
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("Track {}", track.number));
+    let line = format!(
+        "Creating {:02} - {} -> {}",
+        track.number,
+        title,
+        track.output_path.display()
+    );
+    if let Some(progress) = ctx.progress.as_ref() {
+        progress.println(line);
+    } else {
+        println!("{}", line);
+    }
 }
 
 fn cleanup_metadata_blocks(blocks: &mut Vec<*mut flac::FLAC__StreamMetadata>) {
