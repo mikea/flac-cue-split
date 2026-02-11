@@ -15,9 +15,9 @@ type Result<T> = std::result::Result<T, String>;
 #[command(author, version, about)]
 struct Args {
     #[arg(long)]
-    flac: PathBuf,
+    flac: Option<PathBuf>,
     #[arg(long)]
-    cue: PathBuf,
+    cue: Option<PathBuf>,
     #[arg(long, value_name = "ENCODING")]
     cue_encoding: Option<String>,
     #[arg(short = 'y', long)]
@@ -26,6 +26,8 @@ struct Args {
     overwrite: bool,
     #[arg(short = 'c', long, default_value_t = 5, value_parser = parse_compression_level)]
     compression_level: u8,
+    #[arg(value_name = "DIR")]
+    dir: Option<PathBuf>,
 }
 
 pub fn run() -> Result<()> {
@@ -34,9 +36,24 @@ pub fn run() -> Result<()> {
         Some(label) => Some(resolve_encoding(&label)?),
         None => None,
     };
+
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("failed to get current directory: {}", err))?;
+    let (base_dir_abs, display_base_abs) = match args.dir.as_ref() {
+        Some(dir) if dir.is_absolute() => (dir.clone(), None),
+        Some(dir) => (cwd.join(dir), Some(cwd.clone())),
+        None => (cwd.clone(), Some(cwd)),
+    };
+
+    let flac_input =
+        resolve_input_path(&base_dir_abs, display_base_abs.as_deref(), args.flac.as_ref(), "flac")?;
+    let cue_input =
+        resolve_input_path(&base_dir_abs, display_base_abs.as_deref(), args.cue.as_ref(), "cue")?;
+
     split_flac(
-        &args.flac,
-        &args.cue,
+        &flac_input,
+        &cue_input,
+        display_base_abs.as_deref(),
         encoding,
         args.yes,
         args.overwrite,
@@ -45,30 +62,33 @@ pub fn run() -> Result<()> {
 }
 
 fn split_flac(
-    flac_path: &Path,
-    cue_path: &Path,
+    flac_input: &InputPath,
+    cue_input: &InputPath,
+    display_base_abs: Option<&Path>,
     cue_encoding: Option<&'static Encoding>,
     yes: bool,
     overwrite: bool,
     compression_level: u8,
 ) -> Result<()> {
-    let (cue, warnings) = parse_cue_file(cue_path, cue_encoding)?;
+    let (cue, warnings) = parse_cue_file(&cue_input.abs, cue_encoding)?;
     report_cue_warnings(&warnings);
-    validate_cue_files(&cue, flac_path)?;
+    validate_cue_files(&cue, &flac_input.abs)?;
 
-    let output_dir = flac_path
+    let output_dir = flac_input
+        .abs
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut context = DecodeContext::new(cue, output_dir, compression_level);
+    let mut context =
+        DecodeContext::new(cue, output_dir, compression_level, display_base_abs.map(PathBuf::from));
 
     let decoder = unsafe { flac::FLAC__stream_decoder_new() };
     if decoder.is_null() {
         return Err("failed to create FLAC decoder".to_string());
     }
 
-    let flac_path_c = path_to_cstring(flac_path)?;
+    let flac_path_c = path_to_cstring(&flac_input.abs)?;
     let init_status = unsafe {
         flac::FLAC__stream_decoder_set_metadata_respond_all(decoder);
         flac::FLAC__stream_decoder_init_file(
@@ -113,7 +133,12 @@ fn split_flac(
     };
 
     context.prepare_tracks(sample_rate, total_samples, false)?;
-    print_plan(&context, flac_path, cue_path, overwrite)?;
+    print_plan(
+        &context,
+        &flac_input.display,
+        &cue_input.display,
+        overwrite,
+    )?;
     if !confirm_or_exit(yes)? {
         unsafe {
             flac::FLAC__stream_decoder_finish(decoder);
@@ -315,6 +340,98 @@ fn parse_compression_level(value: &str) -> Result<u8> {
         return Err("compression level must be 0-8 or 'max'".to_string());
     }
     Ok(level)
+}
+
+fn resolve_or_find_file(
+    base_dir: &Path,
+    provided: Option<&PathBuf>,
+    extension: &str,
+) -> Result<PathBuf> {
+    if let Some(path) = provided {
+        let resolved = if path.is_absolute() {
+            path.clone()
+        } else {
+            base_dir.join(path)
+        };
+        if !resolved.exists() {
+            return Err(format!("file not found: {}", resolved.display()));
+        }
+        return Ok(resolved);
+    }
+
+    let mut matches = Vec::new();
+    let read_dir = fs::read_dir(base_dir)
+        .map_err(|err| format!("failed to read directory {}: {}", base_dir.display(), err))?;
+    for entry in read_dir {
+        let entry = entry.map_err(|err| format!("failed to read directory entry: {}", err))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = match path.extension().and_then(|ext| ext.to_str()) {
+            Some(ext) => ext.to_ascii_lowercase(),
+            None => continue,
+        };
+        if ext == extension {
+            matches.push(path);
+        }
+    }
+
+    match matches.len() {
+        0 => Err(format!(
+            "no .{} file found in {}",
+            extension,
+            base_dir.display()
+        )),
+        1 => Ok(matches.remove(0)),
+        _ => Err(format!(
+            "multiple .{} files found in {}, please specify --{}",
+            extension,
+            base_dir.display(),
+            extension
+        )),
+    }
+}
+
+struct InputPath {
+    abs: PathBuf,
+    display: PathBuf,
+}
+
+fn resolve_input_path(
+    base_dir_abs: &Path,
+    display_base_abs: Option<&Path>,
+    provided: Option<&PathBuf>,
+    extension: &str,
+) -> Result<InputPath> {
+    if let Some(path) = provided {
+        let abs = if path.is_absolute() {
+            path.clone()
+        } else {
+            base_dir_abs.join(path)
+        };
+        if !abs.exists() {
+            return Err(format!("file not found: {}", abs.display()));
+        }
+        let display = display_path(display_base_abs, &abs);
+        return Ok(InputPath { abs, display });
+    }
+
+    let abs = resolve_or_find_file(base_dir_abs, None, extension)?;
+    let display = display_path(display_base_abs, &abs);
+    Ok(InputPath { abs, display })
+}
+
+fn display_path(base: Option<&Path>, path: &Path) -> PathBuf {
+    if let Some(base) = base {
+        if let Ok(rel) = path.strip_prefix(base) {
+            if rel.as_os_str().is_empty() {
+                return PathBuf::from(".");
+            }
+            return rel.to_path_buf();
+        }
+    }
+    path.to_path_buf()
 }
 
 struct StderrCapture {
@@ -627,10 +744,16 @@ struct DecodeContext {
     next_sample_number: u64,
     progress: Option<ProgressBar>,
     compression_level: u8,
+    display_base_abs: Option<PathBuf>,
 }
 
 impl DecodeContext {
-    fn new(cue: CueDisc, output_dir: PathBuf, compression_level: u8) -> Self {
+    fn new(
+        cue: CueDisc,
+        output_dir: PathBuf,
+        compression_level: u8,
+        display_base_abs: Option<PathBuf>,
+    ) -> Self {
         Self {
             cue,
             output_dir,
@@ -643,6 +766,7 @@ impl DecodeContext {
             next_sample_number: 0,
             progress: None,
             compression_level,
+            display_base_abs,
         }
     }
 
@@ -938,11 +1062,12 @@ fn print_plan(
             ""
         };
 
+        let output_display = display_path(context.display_base_abs.as_deref(), &track.output_path);
         println!(
             "{:02}. {} -> {}{}",
             track.number,
             title,
-            track.output_path.display(),
+            output_display.display(),
             exists_note
         );
         println!(
@@ -1303,7 +1428,7 @@ fn announce_track_start(ctx: &DecodeContext, track: &TrackSpan) {
         "Creating {:02} - {} -> {}",
         track.number,
         title,
-        track.output_path.display()
+        display_path(ctx.display_base_abs.as_deref(), &track.output_path).display()
     );
     if let Some(progress) = ctx.progress.as_ref() {
         progress.println(line);
