@@ -1,13 +1,23 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
-use wavpack_sys as wavpack;
 
 use crate::Result;
 use crate::decoder::{AudioBlock, Decoder, DecoderMetadata};
 use crate::flac::FlacMetadata;
 use crate::picture::build_picture_metadata_from_data;
 use crate::types::InputMetadata;
+
+#[allow(non_snake_case)]
+mod wavpack {
+    #![allow(
+        dead_code,
+        non_camel_case_types,
+        non_upper_case_globals,
+        non_snake_case
+    )]
+    include!(concat!(env!("OUT_DIR"), "/wavpack_bindings.rs"));
+}
 
 pub(crate) struct WavPackDecoder {
     path: PathBuf,

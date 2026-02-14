@@ -7,8 +7,11 @@ Split lossless album images (`.flac` or `.wv`) into per-track FLAC files using m
 Install dependencies:
 
 ```
-sudo apt install cmake bison flex
+sudo apt install bison flex pkg-config libwavpack-dev
 ```
+
+If your distro package is older than 5.9.0, build and install WavPack 5.9.0 from
+https://www.wavpack.com/index.html and make sure `wavpack.pc` is available via `PKG_CONFIG_PATH`.
 
 Installation:
 

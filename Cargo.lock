@@ -251,6 +251,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 name = "flac-cue-split"
 version = "0.4.0"
 dependencies = [
+ "bindgen",
  "clap",
  "cue-sys",
  "encoding_rs",
@@ -258,7 +259,7 @@ dependencies = [
  "libc",
  "libflac-sys",
  "owo-colors",
- "wavpack-sys",
+ "pkg-config",
 ]
 
 [[package]]
@@ -409,6 +410,12 @@ name = "owo-colors"
 version = "4.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c6901729fa79e91a0913333229e9ca5dc725089d1c363b2f4b4760709dc4a52"
+
+[[package]]
+name = "pkg-config"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "portable-atomic"
@@ -588,16 +595,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f01b580c9ac74c8d8f0c0e4afb04eeef2acf145458e52c03845ee9cd23e3d12"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "wavpack-sys"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eeb64ebea7786e7f9ee4c6391d8da68776422ed3aaa49e480ea88ba891e58c77"
-dependencies = [
- "bindgen",
- "cmake",
 ]
 
 [[package]]
