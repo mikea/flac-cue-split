@@ -49,6 +49,7 @@ pub fn run() -> Result<()> {
 
     let output_subdirs = derive_output_subdirs(&pairs)?;
     let total = pairs.len();
+    let enforce_cue_filename_match = total > 1;
     let mut prepared_jobs = Vec::with_capacity(total);
 
     for (pair, output_subdir) in pairs.into_iter().zip(output_subdirs.into_iter()) {
@@ -65,6 +66,7 @@ pub fn run() -> Result<()> {
             delete_original: args.delete_original,
             rename_original: args.rename_original,
             output_subdir,
+            enforce_cue_filename_match,
         })?;
         prepared_jobs.push(prepared);
     }

@@ -28,6 +28,7 @@ pub(crate) struct SplitOptions {
     pub(crate) delete_original: bool,
     pub(crate) rename_original: bool,
     pub(crate) output_subdir: Option<PathBuf>,
+    pub(crate) enforce_cue_filename_match: bool,
 }
 
 pub(crate) struct PreparedSplit {
@@ -123,7 +124,11 @@ impl Drop for PreparedSplit {
 pub(crate) fn prepare_split(options: SplitOptions) -> Result<PreparedSplit> {
     let (cue, warnings, encoding_used, encoding_autodetected) =
         parse_cue_file(&options.cue_input.abs, options.cue_encoding)?;
-    validate_cue_files(&cue, &options.flac_input.abs)?;
+    validate_cue_files(
+        &cue,
+        &options.flac_input.abs,
+        options.enforce_cue_filename_match,
+    )?;
 
     let mut output_dir = options
         .flac_input
@@ -293,7 +298,7 @@ impl Drop for Decoder {
     }
 }
 
-fn validate_cue_files(cue: &CueDisc, flac_path: &Path) -> Result<()> {
+fn validate_cue_files(cue: &CueDisc, flac_path: &Path, enforce_filename_match: bool) -> Result<()> {
     let flac_name = flac_path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -315,6 +320,10 @@ fn validate_cue_files(cue: &CueDisc, flac_path: &Path) -> Result<()> {
         return Err("cue sheet references multiple audio files".to_string());
     }
 
+    if !enforce_filename_match {
+        return Ok(());
+    }
+
     if let Some(name) = files.iter().next() {
         let cue_name = Path::new(name)
             .file_name()
@@ -334,6 +343,66 @@ fn validate_cue_files(cue: &CueDisc, flac_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_cue_files;
+    use crate::types::{CueDisc, CueRem, CueTrack};
+    use std::path::Path;
+
+    fn cue_with_filenames(names: &[&str]) -> CueDisc {
+        let tracks = names
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| CueTrack {
+                number: (idx + 1) as u32,
+                title: None,
+                performer: None,
+                songwriter: None,
+                composer: None,
+                isrc: None,
+                start_frames: 0,
+                length_frames: None,
+                filename: Some((*name).to_string()),
+                rem: CueRem::default(),
+            })
+            .collect();
+
+        CueDisc {
+            title: None,
+            performer: None,
+            songwriter: None,
+            composer: None,
+            genre: None,
+            message: None,
+            disc_id: None,
+            rem: CueRem::default(),
+            tracks,
+        }
+    }
+
+    #[test]
+    fn validate_cue_files_allows_mismatch_for_single_pair_mode() {
+        let cue = cue_with_filenames(&["Different Name.flac"]);
+        let flac_path = Path::new("Album.flac");
+        assert!(validate_cue_files(&cue, flac_path, false).is_ok());
+    }
+
+    #[test]
+    fn validate_cue_files_enforces_match_for_multi_pair_mode() {
+        let cue = cue_with_filenames(&["Different Name.flac"]);
+        let flac_path = Path::new("Album.flac");
+        assert!(validate_cue_files(&cue, flac_path, true).is_err());
+    }
+
+    #[test]
+    fn validate_cue_files_rejects_multiple_audio_files_always() {
+        let cue = cue_with_filenames(&["Disc A.flac", "Disc B.flac"]);
+        let flac_path = Path::new("Disc A.flac");
+        assert!(validate_cue_files(&cue, flac_path, false).is_err());
+        assert!(validate_cue_files(&cue, flac_path, true).is_err());
+    }
 }
 
 pub(crate) struct DecodeContext {
