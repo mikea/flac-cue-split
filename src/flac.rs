@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
-use crate::cli::InputPath;
+use crate::cli::{InputPath, display_path};
 use crate::cue::parse_cue_file;
 use crate::metadata::{build_track_metadata, parse_vorbis_comment};
 use crate::output::{finish_progress, make_progress_bar};
@@ -105,7 +105,12 @@ impl PreparedSplit {
 
         finish_progress(&mut self.context, "done");
         self.context.cleanup();
-        handle_original_flac(&self.flac_abs, self.delete_original, self.rename_original)
+        handle_original_flac(
+            self.context.display_base_abs.as_deref(),
+            &self.flac_abs,
+            self.delete_original,
+            self.rename_original,
+        )
     }
 }
 
@@ -640,6 +645,7 @@ pub(crate) fn processed_flac_path(flac_path: &Path) -> Option<PathBuf> {
 }
 
 fn handle_original_flac(
+    display_base_abs: Option<&Path>,
     flac_path: &Path,
     delete_original: bool,
     rename_original: bool,
@@ -652,10 +658,11 @@ fn handle_original_flac(
                 err
             )
         })?;
+        let display = display_path(display_base_abs, flac_path);
         println!(
             "{} {}",
             "Deleted".red().bold(),
-            flac_path.display().to_string().red()
+            display.display().to_string().red()
         );
         return Ok(());
     }
@@ -671,11 +678,13 @@ fn handle_original_flac(
                 err
             )
         })?;
+        let from_display = display_path(display_base_abs, flac_path);
+        let to_display = display_path(display_base_abs, &renamed);
         println!(
             "{} {} -> {}",
             "Renamed".yellow().bold(),
-            flac_path.display().to_string().yellow(),
-            renamed.display().to_string().yellow()
+            from_display.display().to_string().yellow(),
+            to_display.display().to_string().yellow()
         );
     }
 
