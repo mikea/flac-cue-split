@@ -1,4 +1,3 @@
-use encoding_rs::Encoding;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use owo_colors::OwoColorize;
 use std::io::{self, Write};
@@ -6,27 +5,25 @@ use std::path::Path;
 
 use crate::Result;
 use crate::cli::display_path;
-use crate::flac::{DecodeContext, processed_flac_path};
 use crate::metadata::{compute_common_metadata, compute_unique_metadata_pairs};
+use crate::split::{Plan, processed_flac_path};
+use crate::types::{CueDisc, InputMetadata, TrackSpan};
 
-pub(crate) fn print_plan(
-    context: &DecodeContext,
-    flac_path: &Path,
-    cue_path: &Path,
-    cue_encoding: &'static Encoding,
-    cue_encoding_autodetected: bool,
-    delete_original: bool,
-    rename_original: bool,
-) -> Result<()> {
-    let meta = context
-        .input_meta
-        .as_ref()
-        .ok_or_else(|| "missing input metadata".to_string())?;
-
+pub(crate) fn print_plan(plan: &Plan) -> Result<()> {
+    let cue: &CueDisc = plan.cue();
+    let meta: &InputMetadata = plan.input_meta();
+    let tracks: &[TrackSpan] = plan.tracks();
+    let compression_level = plan.compression_level();
+    let display_base_abs = plan.display_base_abs();
+    let picture_names = plan.picture_names();
+    let input_path = plan.flac_display();
+    let cue_path = plan.cue_display();
+    let (cue_encoding, cue_encoding_autodetected) = plan.cue_encoding();
+    let (delete_original, rename_original) = plan.source_actions();
     if meta.sample_rate == 0 {
         return Err("invalid sample rate in metadata".to_string());
     }
-    if meta.sample_rate % 75 != 0 {
+    if !meta.sample_rate.is_multiple_of(75) {
         return Err(format!(
             "sample rate {} is not divisible by 75 (CUE frames)",
             meta.sample_rate
@@ -36,7 +33,7 @@ pub(crate) fn print_plan(
     let samples_per_frame = (meta.sample_rate / 75) as u64;
 
     println!("{}", "Plan".bold());
-    println!("  {} {}", "FLAC:".cyan(), flac_path.display());
+    println!("  {} {}", "Input:".cyan(), input_path.display());
     if delete_original {
         println!(
             "  {} {}",
@@ -44,7 +41,7 @@ pub(crate) fn print_plan(
             "will be deleted after successful split".red().bold()
         );
     } else if rename_original {
-        let rename_note = match processed_flac_path(flac_path) {
+        let rename_note = match processed_flac_path(input_path) {
             Some(renamed) => format!("will be renamed to {}", renamed.display()),
             None => "will be renamed after successful split".to_string(),
         };
@@ -60,33 +57,28 @@ pub(crate) fn print_plan(
     println!(
         "  {} {} ({} Hz, {} ch, {} bits, compression {})",
         "Tracks:".cyan(),
-        context.tracks.len(),
+        tracks.len(),
         meta.sample_rate,
         meta.channels,
         meta.bits_per_sample,
-        context.compression_level
+        compression_level
     );
 
-    let common_metadata = compute_common_metadata(meta, &context.cue, &context.tracks);
+    let common_metadata = compute_common_metadata(meta, cue, tracks);
     let picture_count = meta.pictures.len();
-    print_shared_metadata(&common_metadata, picture_count, &context.picture_names);
+    print_shared_metadata(&common_metadata, picture_count, picture_names);
 
-    for track in &context.tracks {
+    for track in tracks {
         let start_frames = track.start / samples_per_frame;
         let end_frames = track.end / samples_per_frame;
         let length_frames = end_frames.saturating_sub(start_frames);
 
-        let output_display = display_path(context.display_base_abs.as_deref(), &track.output_path);
+        let output_display = display_path(display_base_abs, &track.output_path);
         let output_target = format_output_target(&output_display);
         let length = format_msf(length_frames);
         let range = format!("({}-{})", format_msf(start_frames), format_msf(end_frames));
-        let unique_metadata = compute_unique_metadata_pairs(
-            meta,
-            &context.cue,
-            &context.tracks,
-            track,
-            &common_metadata,
-        );
+        let unique_metadata =
+            compute_unique_metadata_pairs(meta, cue, tracks, track, &common_metadata);
         let tags = format_tag_pairs(&unique_metadata);
         if tags.is_empty() {
             println!(
@@ -197,8 +189,8 @@ pub(crate) fn make_progress_bar(total_samples: u64) -> ProgressBar {
     }
 }
 
-pub(crate) fn finish_progress(context: &mut DecodeContext, message: &str) {
-    if let Some(pb) = context.progress.take() {
+pub(crate) fn finish_progress(progress: &mut Option<ProgressBar>, message: &str) {
+    if let Some(pb) = progress.take() {
         pb.finish_with_message(message.to_string());
     }
 }

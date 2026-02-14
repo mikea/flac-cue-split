@@ -1,226 +1,130 @@
-use encoding_rs::Encoding;
 use indicatif::ProgressBar;
 use libflac_sys as flac;
 use owo_colors::OwoColorize;
-use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::ffi::{CString, c_void};
-use std::fs;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 
 use crate::Result;
-use crate::cli::{InputPath, display_path};
-use crate::cue::parse_cue_file;
+use crate::cli::display_path;
+use crate::decoder::{AudioBlock, Decoder, DecoderMetadata};
 use crate::metadata::{build_track_metadata, parse_vorbis_comment};
-use crate::output::{finish_progress, make_progress_bar};
-use crate::picture::add_external_picture;
-use crate::types::{CueDisc, CueRem, InputMetadata, TrackSpan};
+use crate::types::{CueDisc, InputMetadata, TrackSpan};
 
-pub(crate) struct SplitOptions {
-    pub(crate) flac_input: InputPath,
-    pub(crate) cue_input: InputPath,
-    pub(crate) display_base_abs: Option<PathBuf>,
-    pub(crate) cue_encoding: Option<&'static Encoding>,
-    pub(crate) overwrite: bool,
-    pub(crate) compression_level: u8,
-    pub(crate) search_dir: PathBuf,
-    pub(crate) picture_enabled: bool,
-    pub(crate) picture_path: Option<PathBuf>,
-    pub(crate) delete_original: bool,
-    pub(crate) rename_original: bool,
-    pub(crate) output_subdir: Option<PathBuf>,
-    pub(crate) enforce_cue_filename_match: bool,
+#[derive(Debug)]
+pub(crate) struct FlacMetadata {
+    ptr: NonNull<flac::FLAC__StreamMetadata>,
 }
 
-pub(crate) struct PreparedSplit {
-    context: Box<DecodeContext>,
-    total_samples: u64,
-    warnings: Vec<String>,
-    flac_display: PathBuf,
-    cue_display: PathBuf,
-    flac_abs: PathBuf,
-    overwrite: bool,
-    delete_original: bool,
-    rename_original: bool,
-    encoding_used: &'static Encoding,
-    encoding_autodetected: bool,
+impl FlacMetadata {
+    pub(crate) fn new(kind: flac::FLAC__MetadataType) -> Result<Self> {
+        let ptr = unsafe { flac::FLAC__metadata_object_new(kind) };
+        Self::from_raw(ptr, "failed to allocate FLAC metadata")
+    }
+
+    pub(crate) fn clone_from_raw(raw: *const flac::FLAC__StreamMetadata) -> Option<Self> {
+        let ptr = unsafe { flac::FLAC__metadata_object_clone(raw) };
+        NonNull::new(ptr).map(|ptr| Self { ptr })
+    }
+
+    pub(crate) fn try_clone(&self) -> Option<Self> {
+        Self::clone_from_raw(self.as_ptr())
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const flac::FLAC__StreamMetadata {
+        self.ptr.as_ptr() as *const flac::FLAC__StreamMetadata
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut flac::FLAC__StreamMetadata {
+        self.ptr.as_ptr()
+    }
+
+    pub(crate) fn collect_raw_ptrs(
+        blocks: &mut [FlacMetadata],
+    ) -> Vec<*mut flac::FLAC__StreamMetadata> {
+        blocks.iter_mut().map(Self::as_mut_ptr).collect()
+    }
+
+    pub(crate) fn as_mut(&mut self) -> &mut flac::FLAC__StreamMetadata {
+        unsafe { self.ptr.as_mut() }
+    }
+
+    fn from_raw(ptr: *mut flac::FLAC__StreamMetadata, err: &str) -> Result<Self> {
+        match NonNull::new(ptr) {
+            Some(ptr) => Ok(Self { ptr }),
+            None => Err(err.to_string()),
+        }
+    }
 }
 
-impl PreparedSplit {
-    pub(crate) fn context(&self) -> &DecodeContext {
-        self.context.as_ref()
+impl Drop for FlacMetadata {
+    fn drop(&mut self) {
+        unsafe {
+            flac::FLAC__metadata_object_delete(self.ptr.as_ptr());
+        }
+    }
+}
+
+pub(crate) struct FlacDecoder {
+    path: PathBuf,
+}
+
+impl FlacDecoder {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path }
     }
 
-    pub(crate) fn flac_display(&self) -> &Path {
-        &self.flac_display
-    }
+    fn read_metadata_internal(&self) -> Result<DecoderMetadata> {
+        let mut decoder = FlacStreamDecoder::new()?;
+        let mut state = Box::new(FlacMetadataState::new());
 
-    pub(crate) fn cue_display(&self) -> &Path {
-        &self.cue_display
-    }
-
-    pub(crate) fn cue_encoding(&self) -> (&'static Encoding, bool) {
-        (self.encoding_used, self.encoding_autodetected)
-    }
-
-    pub(crate) fn source_actions(&self) -> (bool, bool) {
-        (self.delete_original, self.rename_original)
-    }
-
-    pub(crate) fn warnings(&self) -> &[String] {
-        &self.warnings
-    }
-
-    pub(crate) fn execute(mut self) -> Result<()> {
-        self.context.error = None;
-        self.context.progress = None;
-
-        let progress = make_progress_bar(self.total_samples);
-        self.context.progress = Some(progress.clone());
-
-        ensure_output_paths_available(&self.context.tracks, self.overwrite)?;
-
-        let mut decoder = Decoder::new()?;
         decoder.init_file(
-            &self.flac_abs,
-            Some(decoder_write_callback),
+            &self.path,
             None,
-            Some(decoder_error_callback),
-            &mut *self.context as *mut _ as *mut c_void,
+            Some(flac_metadata_callback),
+            Some(flac_metadata_error_callback),
+            state.as_mut() as *mut _ as *mut c_void,
         )?;
 
-        let ok = decoder.process_until_end_of_stream();
+        let ok = decoder.process_until_end_of_metadata();
         if ok == 0 {
-            let error = self
-                .context
+            return Err(state
                 .error
                 .take()
-                .unwrap_or_else(|| "FLAC decoding failed".to_string());
-            finish_progress(&mut self.context, "aborted");
-            return Err(error);
+                .unwrap_or_else(|| "failed to read FLAC metadata".to_string()));
+        }
+        if let Some(err) = state.error.take() {
+            return Err(err);
         }
 
-        if let Err(error) = self.context.finish_encoder() {
-            finish_progress(&mut self.context, "aborted");
-            return Err(error);
-        }
+        let input_meta = std::mem::replace(&mut state.meta, InputMetadata::new());
+        Ok(DecoderMetadata {
+            input_meta,
+            picture_names: Vec::new(),
+        })
+    }
 
-        finish_progress(&mut self.context, "done");
-        self.context.cleanup();
-        handle_original_flac(
-            self.context.display_base_abs.as_deref(),
-            &self.flac_abs,
-            self.delete_original,
-            self.rename_original,
-        )
+    fn block_iter(&self) -> Result<FlacBlockIter> {
+        FlacBlockIter::new(&self.path)
     }
 }
 
-impl Drop for PreparedSplit {
-    fn drop(&mut self) {
-        self.context.cleanup();
+impl Decoder for FlacDecoder {
+    fn read_metadata(&mut self) -> Result<DecoderMetadata> {
+        self.read_metadata_internal()
+    }
+
+    fn into_blocks(self: Box<Self>) -> Result<Box<dyn Iterator<Item = Result<AudioBlock>>>> {
+        Ok(Box::new(self.block_iter()?))
     }
 }
 
-pub(crate) fn prepare_split(options: SplitOptions) -> Result<PreparedSplit> {
-    let (cue, warnings, encoding_used, encoding_autodetected) =
-        parse_cue_file(&options.cue_input.abs, options.cue_encoding)?;
-    validate_cue_files(
-        &cue,
-        &options.flac_input.abs,
-        options.enforce_cue_filename_match,
-    )?;
-
-    let mut output_dir = options
-        .flac_input
-        .abs
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    if let Some(subdir) = options.output_subdir.as_ref() {
-        output_dir = output_dir.join(subdir);
-    }
-    fs::create_dir_all(&output_dir).map_err(|err| {
-        format!(
-            "failed to create output directory {}: {}",
-            output_dir.display(),
-            err
-        )
-    })?;
-
-    let context = DecodeContext::new(
-        cue,
-        output_dir,
-        options.compression_level,
-        options.display_base_abs.clone(),
-    );
-    let mut context = Box::new(context);
-
-    let mut decoder = Decoder::new()?;
-    decoder.init_file(
-        &options.flac_input.abs,
-        Some(decoder_write_callback),
-        Some(decoder_metadata_callback),
-        Some(decoder_error_callback),
-        &mut *context as *mut _ as *mut c_void,
-    )?;
-
-    let ok = decoder.process_until_end_of_metadata();
-    if ok == 0 {
-        let error = context
-            .error
-            .take()
-            .unwrap_or_else(|| "failed to read FLAC metadata".to_string());
-        return Err(error);
-    }
-
-    let (sample_rate, total_samples) = {
-        let meta = context
-            .input_meta
-            .as_ref()
-            .ok_or_else(|| "missing FLAC stream info".to_string())?;
-        (meta.sample_rate, meta.total_samples)
-    };
-
-    if options.picture_enabled {
-        let meta = context
-            .input_meta
-            .as_mut()
-            .ok_or_else(|| "missing input metadata".to_string())?;
-        add_external_picture(
-            meta,
-            &mut context.picture_names,
-            &options.search_dir,
-            options.picture_path.as_deref(),
-        )?;
-    }
-
-    context.prepare_tracks(sample_rate, total_samples, false)?;
-    Ok(PreparedSplit {
-        context,
-        total_samples,
-        warnings,
-        flac_display: options.flac_input.display,
-        cue_display: options.cue_input.display,
-        flac_abs: options.flac_input.abs,
-        overwrite: options.overwrite,
-        delete_original: options.delete_original,
-        rename_original: options.rename_original,
-        encoding_used,
-        encoding_autodetected,
-    })
-}
-
-fn path_to_cstring(path: &Path) -> Result<CString> {
-    let path_str = path.to_string_lossy();
-    CString::new(path_str.as_bytes())
-        .map_err(|_| format!("path contains NUL byte: {}", path.display()))
-}
-
-struct Decoder {
+struct FlacStreamDecoder {
     decoder: *mut flac::FLAC__StreamDecoder,
 }
 
-impl Decoder {
+impl FlacStreamDecoder {
     fn new() -> Result<Self> {
         let decoder = unsafe { flac::FLAC__stream_decoder_new() };
         if decoder.is_null() {
@@ -231,7 +135,7 @@ impl Decoder {
 
     fn init_file(
         &mut self,
-        flac_path: &Path,
+        path: &Path,
         write_cb: Option<
             unsafe extern "C" fn(
                 *const flac::FLAC__StreamDecoder,
@@ -256,12 +160,12 @@ impl Decoder {
         >,
         client_data: *mut c_void,
     ) -> Result<()> {
-        let flac_path_c = path_to_cstring(flac_path)?;
+        let path_c = path_to_cstring(path)?;
         let init_status = unsafe {
             flac::FLAC__stream_decoder_set_metadata_respond_all(self.decoder);
             flac::FLAC__stream_decoder_init_file(
                 self.decoder,
-                flac_path_c.as_ptr(),
+                path_c.as_ptr(),
                 write_cb,
                 metadata_cb,
                 error_cb,
@@ -281,12 +185,16 @@ impl Decoder {
         unsafe { flac::FLAC__stream_decoder_process_until_end_of_metadata(self.decoder) }
     }
 
-    fn process_until_end_of_stream(&mut self) -> i32 {
-        unsafe { flac::FLAC__stream_decoder_process_until_end_of_stream(self.decoder) }
+    fn process_single(&mut self) -> i32 {
+        unsafe { flac::FLAC__stream_decoder_process_single(self.decoder) }
+    }
+
+    fn state(&self) -> flac::FLAC__StreamDecoderState {
+        unsafe { flac::FLAC__stream_decoder_get_state(self.decoder) }
     }
 }
 
-impl Drop for Decoder {
+impl Drop for FlacStreamDecoder {
     fn drop(&mut self) {
         if !self.decoder.is_null() {
             unsafe {
@@ -298,206 +206,216 @@ impl Drop for Decoder {
     }
 }
 
-fn validate_cue_files(cue: &CueDisc, flac_path: &Path, enforce_filename_match: bool) -> Result<()> {
-    let flac_name = flac_path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| flac_path.to_string_lossy().to_string());
-
-    let flac_stem = flac_path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().to_string())
-        .unwrap_or_else(|| flac_name.clone());
-
-    let mut files = HashSet::new();
-    for track in &cue.tracks {
-        if let Some(name) = &track.filename {
-            files.insert(name.clone());
-        }
-    }
-
-    if files.len() > 1 {
-        return Err("cue sheet references multiple audio files".to_string());
-    }
-
-    if !enforce_filename_match {
-        return Ok(());
-    }
-
-    if let Some(name) = files.iter().next() {
-        let cue_name = Path::new(name)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| name.clone());
-        let cue_stem = Path::new(name)
-            .file_stem()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| cue_name.clone());
-
-        if cue_name != flac_name && cue_stem != flac_stem {
-            return Err(format!(
-                "cue sheet references {}, but --flac is {}",
-                cue_name, flac_name
-            ));
-        }
-    }
-
-    Ok(())
+struct FlacMetadataState {
+    meta: InputMetadata,
+    error: Option<String>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::validate_cue_files;
-    use crate::types::{CueDisc, CueRem, CueTrack};
-    use std::path::Path;
-
-    fn cue_with_filenames(names: &[&str]) -> CueDisc {
-        let tracks = names
-            .iter()
-            .enumerate()
-            .map(|(idx, name)| CueTrack {
-                number: (idx + 1) as u32,
-                title: None,
-                performer: None,
-                songwriter: None,
-                composer: None,
-                isrc: None,
-                start_frames: 0,
-                length_frames: None,
-                filename: Some((*name).to_string()),
-                rem: CueRem::default(),
-            })
-            .collect();
-
-        CueDisc {
-            title: None,
-            performer: None,
-            songwriter: None,
-            composer: None,
-            genre: None,
-            message: None,
-            disc_id: None,
-            rem: CueRem::default(),
-            tracks,
-        }
-    }
-
-    #[test]
-    fn validate_cue_files_allows_mismatch_for_single_pair_mode() {
-        let cue = cue_with_filenames(&["Different Name.flac"]);
-        let flac_path = Path::new("Album.flac");
-        assert!(validate_cue_files(&cue, flac_path, false).is_ok());
-    }
-
-    #[test]
-    fn validate_cue_files_enforces_match_for_multi_pair_mode() {
-        let cue = cue_with_filenames(&["Different Name.flac"]);
-        let flac_path = Path::new("Album.flac");
-        assert!(validate_cue_files(&cue, flac_path, true).is_err());
-    }
-
-    #[test]
-    fn validate_cue_files_rejects_multiple_audio_files_always() {
-        let cue = cue_with_filenames(&["Disc A.flac", "Disc B.flac"]);
-        let flac_path = Path::new("Disc A.flac");
-        assert!(validate_cue_files(&cue, flac_path, false).is_err());
-        assert!(validate_cue_files(&cue, flac_path, true).is_err());
-    }
-}
-
-pub(crate) struct DecodeContext {
-    pub(crate) cue: CueDisc,
-    pub(crate) output_dir: PathBuf,
-    pub(crate) input_meta: Option<InputMetadata>,
-    pub(crate) tracks: Vec<TrackSpan>,
-    track_index: usize,
-    encoder: Option<TrackEncoder>,
-    interleaved: Vec<i32>,
-    pub(crate) error: Option<String>,
-    next_sample_number: u64,
-    pub(crate) progress: Option<ProgressBar>,
-    pub(crate) compression_level: u8,
-    pub(crate) display_base_abs: Option<PathBuf>,
-    pub(crate) picture_names: Vec<String>,
-}
-
-impl DecodeContext {
-    fn new(
-        cue: CueDisc,
-        output_dir: PathBuf,
-        compression_level: u8,
-        display_base_abs: Option<PathBuf>,
-    ) -> Self {
+impl FlacMetadataState {
+    fn new() -> Self {
         Self {
-            cue,
-            output_dir,
-            input_meta: None,
-            tracks: Vec::new(),
-            track_index: 0,
-            encoder: None,
-            interleaved: Vec::new(),
+            meta: InputMetadata::new(),
+            error: None,
+        }
+    }
+}
+
+unsafe extern "C" fn flac_metadata_callback(
+    _decoder: *const flac::FLAC__StreamDecoder,
+    metadata: *const flac::FLAC__StreamMetadata,
+    client_data: *mut c_void,
+) {
+    if client_data.is_null() || metadata.is_null() {
+        return;
+    }
+
+    let state = unsafe { &mut *(client_data as *mut FlacMetadataState) };
+    let metadata_ref = unsafe { &*metadata };
+
+    match metadata_ref.type_ {
+        flac::FLAC__METADATA_TYPE_STREAMINFO => {
+            let info = unsafe { metadata_ref.data.stream_info };
+            state.meta.sample_rate = info.sample_rate;
+            state.meta.channels = info.channels;
+            state.meta.bits_per_sample = info.bits_per_sample;
+            state.meta.total_samples = info.total_samples;
+        }
+        flac::FLAC__METADATA_TYPE_VORBIS_COMMENT => {
+            let (vendor, comments) = parse_vorbis_comment(metadata_ref);
+            state.meta.vendor = vendor;
+            state.meta.comments = comments;
+        }
+        flac::FLAC__METADATA_TYPE_PICTURE => {
+            if let Some(clone) = FlacMetadata::clone_from_raw(metadata) {
+                state.meta.pictures.push(clone);
+            }
+        }
+        _ => {}
+    }
+}
+
+unsafe extern "C" fn flac_metadata_error_callback(
+    _decoder: *const flac::FLAC__StreamDecoder,
+    status: flac::FLAC__StreamDecoderErrorStatus,
+    client_data: *mut c_void,
+) {
+    if client_data.is_null() {
+        return;
+    }
+    let state = unsafe { &mut *(client_data as *mut FlacMetadataState) };
+    state.error = Some(format!("FLAC decoder error status {}", status));
+}
+
+struct FlacBlockState {
+    blocks: VecDeque<AudioBlock>,
+    error: Option<String>,
+    next_sample_number: u64,
+}
+
+impl FlacBlockState {
+    fn new() -> Self {
+        Self {
+            blocks: VecDeque::new(),
             error: None,
             next_sample_number: 0,
-            progress: None,
-            compression_level,
-            display_base_abs,
-            picture_names: Vec::new(),
         }
     }
+}
 
-    fn prepare_tracks(
-        &mut self,
-        sample_rate: u32,
-        total_samples: u64,
-        check_exists: bool,
-    ) -> Result<()> {
-        let tracks = compute_track_spans(&self.cue, sample_rate, total_samples)?;
-        let output_paths = compute_output_paths(&tracks, &self.output_dir, check_exists)?;
-        let mut spans = Vec::with_capacity(tracks.len());
-        for (track, output_path) in tracks.into_iter().zip(output_paths.into_iter()) {
-            spans.push(TrackSpan {
-                number: track.number,
-                start: track.start,
-                end: track.end,
-                title: track.title,
-                performer: track.performer,
-                songwriter: track.songwriter,
-                composer: track.composer,
-                isrc: track.isrc,
-                rem: track.rem,
-                output_path,
-            });
-        }
-        self.tracks = spans;
-        Ok(())
+struct FlacBlockIter {
+    decoder: FlacStreamDecoder,
+    state: Box<FlacBlockState>,
+    done: bool,
+}
+
+impl FlacBlockIter {
+    fn new(path: &Path) -> Result<Self> {
+        let mut decoder = FlacStreamDecoder::new()?;
+        let mut state = Box::new(FlacBlockState::new());
+
+        decoder.init_file(
+            path,
+            Some(flac_write_callback),
+            None,
+            Some(flac_stream_error_callback),
+            state.as_mut() as *mut _ as *mut c_void,
+        )?;
+
+        Ok(Self {
+            decoder,
+            state,
+            done: false,
+        })
     }
+}
 
-    fn finish_encoder(&mut self) -> Result<()> {
-        if let Some(mut encoder) = self.encoder.take() {
-            encoder.finish()?;
+impl Iterator for FlacBlockIter {
+    type Item = Result<AudioBlock>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(block) = self.state.blocks.pop_front() {
+            return Some(Ok(block));
         }
-        Ok(())
-    }
+        if self.done {
+            return None;
+        }
 
-    fn cleanup(&mut self) {
-        if let Some(meta) = self.input_meta.take() {
-            for picture in meta.pictures {
-                unsafe {
-                    if !picture.is_null() {
-                        flac::FLAC__metadata_object_delete(picture);
-                    }
-                }
+        loop {
+            let ok = self.decoder.process_single();
+            if ok == 0 {
+                self.done = true;
+                let err = self
+                    .state
+                    .error
+                    .take()
+                    .unwrap_or_else(|| "FLAC decoding failed".to_string());
+                return Some(Err(err));
+            }
+
+            if let Some(err) = self.state.error.take() {
+                self.done = true;
+                return Some(Err(err));
+            }
+
+            if let Some(block) = self.state.blocks.pop_front() {
+                return Some(Ok(block));
+            }
+
+            if self.decoder.state() == flac::FLAC__STREAM_DECODER_END_OF_STREAM {
+                self.done = true;
+                return None;
             }
         }
     }
 }
 
-struct TrackEncoder {
+unsafe extern "C" fn flac_stream_error_callback(
+    _decoder: *const flac::FLAC__StreamDecoder,
+    status: flac::FLAC__StreamDecoderErrorStatus,
+    client_data: *mut c_void,
+) {
+    if client_data.is_null() {
+        return;
+    }
+    let state = unsafe { &mut *(client_data as *mut FlacBlockState) };
+    state.error = Some(format!("FLAC decoder error status {}", status));
+}
+
+unsafe extern "C" fn flac_write_callback(
+    _decoder: *const flac::FLAC__StreamDecoder,
+    frame: *const flac::FLAC__Frame,
+    buffer: *const *const i32,
+    client_data: *mut c_void,
+) -> flac::FLAC__StreamDecoderWriteStatus {
+    if frame.is_null() || buffer.is_null() || client_data.is_null() {
+        return flac::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    }
+
+    let state = unsafe { &mut *(client_data as *mut FlacBlockState) };
+    if state.error.is_some() {
+        return flac::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+    }
+
+    let frame_ref = unsafe { &*frame };
+    let channels = frame_ref.header.channels as usize;
+    let block_samples = frame_ref.header.blocksize as usize;
+    if channels == 0 || block_samples == 0 {
+        return flac::FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+    }
+
+    let sample_index =
+        if frame_ref.header.number_type == flac::FLAC__FRAME_NUMBER_TYPE_SAMPLE_NUMBER {
+            unsafe { frame_ref.header.number.sample_number }
+        } else {
+            state.next_sample_number
+        };
+    state.next_sample_number = sample_index + block_samples as u64;
+
+    let mut interleaved = Vec::with_capacity(block_samples * channels);
+    for i in 0..block_samples {
+        for ch in 0..channels {
+            unsafe {
+                let chan_ptr = *buffer.add(ch);
+                interleaved.push(*chan_ptr.add(i));
+            }
+        }
+    }
+
+    state.blocks.push_back(AudioBlock {
+        sample_index,
+        channels: channels as u32,
+        interleaved,
+    });
+
+    flac::FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE
+}
+
+pub(crate) struct TrackEncoder {
     encoder: *mut flac::FLAC__StreamEncoder,
 }
 
 impl TrackEncoder {
-    fn write_interleaved(&mut self, interleaved: &[i32], samples: u32) -> Result<()> {
+    pub(crate) fn write_interleaved(&mut self, interleaved: &[i32], samples: u32) -> Result<()> {
         if self.encoder.is_null() {
             return Err("encoder not initialized".to_string());
         }
@@ -514,7 +432,7 @@ impl TrackEncoder {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<()> {
+    pub(crate) fn finish(&mut self) -> Result<()> {
         if self.encoder.is_null() {
             return Ok(());
         }
@@ -542,412 +460,15 @@ impl Drop for TrackEncoder {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ComputedTrack {
-    pub(crate) number: u32,
-    pub(crate) start: u64,
-    pub(crate) end: u64,
-    pub(crate) title: Option<String>,
-    pub(crate) performer: Option<String>,
-    pub(crate) songwriter: Option<String>,
-    pub(crate) composer: Option<String>,
-    pub(crate) isrc: Option<String>,
-    pub(crate) rem: CueRem,
-}
-
-pub(crate) fn compute_track_spans(
+pub(crate) fn start_track_encoder(
+    meta: &InputMetadata,
     cue: &CueDisc,
-    sample_rate: u32,
-    total_samples: u64,
-) -> Result<Vec<ComputedTrack>> {
-    if sample_rate == 0 {
-        return Err("FLAC sample rate is zero".to_string());
-    }
-    if !sample_rate.is_multiple_of(75) {
-        return Err(format!(
-            "sample rate {} is not divisible by 75 (CUE frames)",
-            sample_rate
-        ));
-    }
-
-    let mut tracks = Vec::with_capacity(cue.tracks.len());
-    for (idx, track) in cue.tracks.iter().enumerate() {
-        let start = frames_to_samples(track.start_frames, sample_rate)?;
-        let length_frames = match track.length_frames {
-            Some(length) if length >= 0 => Some(length),
-            _ => {
-                if idx + 1 < cue.tracks.len() {
-                    let next_start = cue.tracks[idx + 1].start_frames;
-                    Some(next_start - track.start_frames)
-                } else {
-                    None
-                }
-            }
-        };
-
-        let end = if let Some(length) = length_frames {
-            start + frames_to_samples(length, sample_rate)?
-        } else {
-            if total_samples == 0 {
-                return Err("FLAC total samples unavailable for final track".to_string());
-            }
-            total_samples
-        };
-
-        if end <= start {
-            return Err(format!("track {} has invalid length", track.number));
-        }
-        if total_samples > 0 && end > total_samples {
-            return Err(format!("track {} exceeds FLAC total samples", track.number));
-        }
-
-        tracks.push(ComputedTrack {
-            number: track.number,
-            start,
-            end,
-            title: track.title.clone(),
-            performer: track.performer.clone(),
-            songwriter: track.songwriter.clone(),
-            composer: track.composer.clone(),
-            isrc: track.isrc.clone(),
-            rem: track.rem.clone(),
-        });
-    }
-
-    Ok(tracks)
-}
-
-pub(crate) fn frames_to_samples(frames: i64, sample_rate: u32) -> Result<u64> {
-    if frames < 0 {
-        return Err("negative frame count in cue sheet".to_string());
-    }
-    if !sample_rate.is_multiple_of(75) {
-        return Err(format!(
-            "sample rate {} is not divisible by 75",
-            sample_rate
-        ));
-    }
-    let samples_per_frame = (sample_rate / 75) as u64;
-    Ok(frames as u64 * samples_per_frame)
-}
-
-fn compute_output_paths(
-    tracks: &[ComputedTrack],
-    output_dir: &Path,
-    check_exists: bool,
-) -> Result<Vec<PathBuf>> {
-    let width = tracks.len().to_string().len();
-    let mut seen = HashSet::new();
-    let mut paths = Vec::with_capacity(tracks.len());
-    for track in tracks {
-        let name = track
-            .title
-            .as_deref()
-            .map(sanitize_filename)
-            .unwrap_or_else(String::new);
-
-        let base = if name.is_empty() {
-            format!("{:0width$}", track.number, width = width)
-        } else {
-            format!("{:0width$} - {}", track.number, name, width = width)
-        };
-
-        let filename = format!("{}.flac", base);
-        let path = output_dir.join(filename);
-
-        if check_exists && path.exists() {
-            return Err(format!("output file already exists: {}", path.display()));
-        }
-        if !seen.insert(path.clone()) {
-            return Err(format!(
-                "duplicate output filename for track {}",
-                track.number
-            ));
-        }
-
-        paths.push(path);
-    }
-
-    Ok(paths)
-}
-
-pub(crate) fn sanitize_filename(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars() {
-        if ch == '/' || ch == '\\' || ch == '\0' {
-            out.push('_');
-            continue;
-        }
-        if ch.is_control() {
-            continue;
-        }
-        out.push(ch);
-    }
-    out.trim().to_string()
-}
-
-fn ensure_output_paths_available(tracks: &[TrackSpan], overwrite: bool) -> Result<()> {
-    for track in tracks {
-        if track.output_path.exists() {
-            if overwrite {
-                fs::remove_file(&track.output_path).map_err(|err| {
-                    format!(
-                        "failed to remove existing file {}: {}",
-                        track.output_path.display(),
-                        err
-                    )
-                })?;
-            } else {
-                return Err(format!(
-                    "output file already exists: {}",
-                    track.output_path.display()
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn processed_flac_path(flac_path: &Path) -> Option<PathBuf> {
-    let file_name = flac_path.file_name()?.to_str()?;
-    Some(flac_path.with_file_name(format!("{}.processed", file_name)))
-}
-
-fn handle_original_flac(
+    tracks: &[TrackSpan],
+    track: &TrackSpan,
+    compression_level: u8,
     display_base_abs: Option<&Path>,
-    flac_path: &Path,
-    delete_original: bool,
-    rename_original: bool,
-) -> Result<()> {
-    if delete_original {
-        fs::remove_file(flac_path).map_err(|err| {
-            format!(
-                "split succeeded, but failed to delete original file {}: {}",
-                flac_path.display(),
-                err
-            )
-        })?;
-        let display = display_path(display_base_abs, flac_path);
-        println!(
-            "{} {}",
-            "Deleted".red().bold(),
-            display.display().to_string().red()
-        );
-        return Ok(());
-    }
-
-    if rename_original {
-        let renamed = processed_flac_path(flac_path)
-            .ok_or_else(|| format!("failed to rename original file: {}", flac_path.display()))?;
-        fs::rename(flac_path, &renamed).map_err(|err| {
-            format!(
-                "split succeeded, but failed to rename original file {} -> {}: {}",
-                flac_path.display(),
-                renamed.display(),
-                err
-            )
-        })?;
-        let from_display = display_path(display_base_abs, flac_path);
-        let to_display = display_path(display_base_abs, &renamed);
-        println!(
-            "{} {} -> {}",
-            "Renamed".yellow().bold(),
-            from_display.display().to_string().yellow(),
-            to_display.display().to_string().yellow()
-        );
-    }
-
-    Ok(())
-}
-
-unsafe extern "C" fn decoder_metadata_callback(
-    _decoder: *const flac::FLAC__StreamDecoder,
-    metadata: *const flac::FLAC__StreamMetadata,
-    client_data: *mut c_void,
-) {
-    if client_data.is_null() || metadata.is_null() {
-        return;
-    }
-    let ctx = unsafe { &mut *(client_data as *mut DecodeContext) };
-    let meta = ctx.input_meta.get_or_insert_with(InputMetadata::new);
-
-    let metadata_ref = unsafe { &*metadata };
-    match metadata_ref.type_ {
-        flac::FLAC__METADATA_TYPE_STREAMINFO => {
-            let info = unsafe { metadata_ref.data.stream_info };
-            meta.sample_rate = info.sample_rate;
-            meta.channels = info.channels;
-            meta.bits_per_sample = info.bits_per_sample;
-            meta.total_samples = info.total_samples;
-        }
-        flac::FLAC__METADATA_TYPE_VORBIS_COMMENT => {
-            let (vendor, comments) = parse_vorbis_comment(metadata_ref);
-            meta.vendor = vendor;
-            meta.comments = comments;
-        }
-        flac::FLAC__METADATA_TYPE_PICTURE => {
-            let clone = unsafe { flac::FLAC__metadata_object_clone(metadata as *const _) };
-            if !clone.is_null() {
-                meta.pictures.push(clone);
-            }
-        }
-        _ => {}
-    }
-}
-
-unsafe extern "C" fn decoder_error_callback(
-    _decoder: *const flac::FLAC__StreamDecoder,
-    status: flac::FLAC__StreamDecoderErrorStatus,
-    client_data: *mut c_void,
-) {
-    if client_data.is_null() {
-        return;
-    }
-    let ctx = unsafe { &mut *(client_data as *mut DecodeContext) };
-    ctx.error = Some(format!("FLAC decoder error status {}", status));
-}
-
-unsafe extern "C" fn decoder_write_callback(
-    _decoder: *const flac::FLAC__StreamDecoder,
-    frame: *const flac::FLAC__Frame,
-    buffer: *const *const i32,
-    client_data: *mut c_void,
-) -> flac::FLAC__StreamDecoderWriteStatus {
-    if client_data.is_null() || frame.is_null() || buffer.is_null() {
-        return flac::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-    }
-    let ctx = unsafe { &mut *(client_data as *mut DecodeContext) };
-    if ctx.error.is_some() {
-        return flac::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-    }
-    if ctx.input_meta.is_none() {
-        ctx.error = Some("missing FLAC metadata before audio data".to_string());
-        return flac::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-    }
-
-    let frame_ref = unsafe { &*frame };
-    let block_samples = frame_ref.header.blocksize as usize;
-    if block_samples == 0 {
-        return flac::FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
-    }
-    if let Some(progress) = ctx.progress.as_ref() {
-        progress.inc(block_samples as u64);
-    }
-
-    let mut block_start =
-        if frame_ref.header.number_type == flac::FLAC__FRAME_NUMBER_TYPE_SAMPLE_NUMBER {
-            unsafe { frame_ref.header.number.sample_number }
-        } else {
-            ctx.next_sample_number
-        };
-    ctx.next_sample_number = block_start + block_samples as u64;
-
-    let mut local_offset = 0usize;
-    let mut remaining = block_samples;
-
-    while remaining > 0 {
-        if ctx.track_index >= ctx.tracks.len() {
-            break;
-        }
-
-        let track = &ctx.tracks[ctx.track_index];
-
-        if block_start < track.start {
-            let skip = std::cmp::min(remaining, (track.start - block_start) as usize);
-            block_start += skip as u64;
-            local_offset += skip;
-            remaining -= skip;
-            if remaining == 0 {
-                break;
-            }
-        }
-
-        if block_start >= track.end {
-            if let Err(err) = ctx.finish_encoder() {
-                ctx.error = Some(err);
-                return flac::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-            }
-            ctx.track_index += 1;
-            continue;
-        }
-
-        let take = std::cmp::min(remaining, (track.end - block_start) as usize);
-        if take == 0 {
-            break;
-        }
-
-        if ctx.encoder.is_none() {
-            match start_track_encoder(ctx, track) {
-                Ok(enc) => ctx.encoder = Some(enc),
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return flac::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-                }
-            }
-        }
-
-        let channels = match ctx.input_meta.as_ref() {
-            Some(meta) if meta.channels > 0 => meta.channels as usize,
-            _ => {
-                ctx.error = Some("invalid channel count in metadata".to_string());
-                return flac::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-            }
-        };
-
-        interleave_samples(buffer, local_offset, take, &mut ctx.interleaved, channels);
-        if let Some(encoder) = ctx.encoder.as_mut()
-            && let Err(err) = encoder.write_interleaved(&ctx.interleaved, take as u32)
-        {
-            ctx.error = Some(err);
-            return flac::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-        }
-
-        block_start += take as u64;
-        local_offset += take;
-        remaining -= take;
-
-        if block_start >= track.end {
-            if let Err(err) = ctx.finish_encoder() {
-                ctx.error = Some(err);
-                return flac::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-            }
-            ctx.track_index += 1;
-        }
-    }
-
-    flac::FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE
-}
-
-fn interleave_samples(
-    buffer: *const *const i32,
-    offset: usize,
-    samples: usize,
-    out: &mut Vec<i32>,
-    channels: usize,
-) {
-    if channels == 0 {
-        return;
-    }
-
-    out.clear();
-    out.reserve(samples * channels);
-
-    for i in 0..samples {
-        for ch in 0..channels {
-            unsafe {
-                let chan_ptr = *buffer.add(ch);
-                out.push(*chan_ptr.add(offset + i));
-            }
-        }
-    }
-}
-
-fn start_track_encoder(ctx: &DecodeContext, track: &TrackSpan) -> Result<TrackEncoder> {
-    let meta = ctx
-        .input_meta
-        .as_ref()
-        .ok_or_else(|| "missing input metadata".to_string())?;
-
+    progress: Option<&ProgressBar>,
+) -> Result<TrackEncoder> {
     let encoder = unsafe { flac::FLAC__stream_encoder_new() };
     if encoder.is_null() {
         return Err("failed to create FLAC encoder".to_string());
@@ -957,10 +478,8 @@ fn start_track_encoder(ctx: &DecodeContext, track: &TrackSpan) -> Result<TrackEn
         flac::FLAC__stream_encoder_set_channels(encoder, meta.channels) != 0
             && flac::FLAC__stream_encoder_set_bits_per_sample(encoder, meta.bits_per_sample) != 0
             && flac::FLAC__stream_encoder_set_sample_rate(encoder, meta.sample_rate) != 0
-            && flac::FLAC__stream_encoder_set_compression_level(
-                encoder,
-                ctx.compression_level as u32,
-            ) != 0
+            && flac::FLAC__stream_encoder_set_compression_level(encoder, compression_level as u32)
+                != 0
     };
     if !ok {
         unsafe {
@@ -974,17 +493,17 @@ fn start_track_encoder(ctx: &DecodeContext, track: &TrackSpan) -> Result<TrackEn
         flac::FLAC__stream_encoder_set_total_samples_estimate(encoder, track_samples);
     }
 
-    let mut metadata_blocks = build_track_metadata(meta, &ctx.cue, &ctx.tracks, track)?;
+    let mut metadata_blocks = build_track_metadata(meta, cue, tracks, track)?;
     if !metadata_blocks.is_empty() {
+        let mut metadata_ptrs = FlacMetadata::collect_raw_ptrs(&mut metadata_blocks);
         let ok = unsafe {
             flac::FLAC__stream_encoder_set_metadata(
                 encoder,
-                metadata_blocks.as_mut_ptr(),
-                metadata_blocks.len() as u32,
+                metadata_ptrs.as_mut_ptr(),
+                metadata_ptrs.len() as u32,
             ) != 0
         };
         if !ok {
-            cleanup_metadata_blocks(&mut metadata_blocks);
             unsafe {
                 flac::FLAC__stream_encoder_delete(encoder);
             }
@@ -997,8 +516,6 @@ fn start_track_encoder(ctx: &DecodeContext, track: &TrackSpan) -> Result<TrackEn
         flac::FLAC__stream_encoder_init_file(encoder, path_c.as_ptr(), None, std::ptr::null_mut())
     };
 
-    cleanup_metadata_blocks(&mut metadata_blocks);
-
     if init_status != flac::FLAC__STREAM_ENCODER_INIT_STATUS_OK {
         unsafe {
             flac::FLAC__stream_encoder_delete(encoder);
@@ -1009,30 +526,29 @@ fn start_track_encoder(ctx: &DecodeContext, track: &TrackSpan) -> Result<TrackEn
         ));
     }
 
-    announce_track_start(ctx, track);
+    announce_track_start(display_base_abs, progress, track);
 
     Ok(TrackEncoder { encoder })
 }
 
-fn cleanup_metadata_blocks(blocks: &mut Vec<*mut flac::FLAC__StreamMetadata>) {
-    for block in blocks.drain(..) {
-        if !block.is_null() {
-            unsafe {
-                flac::FLAC__metadata_object_delete(block);
-            }
-        }
-    }
+fn path_to_cstring(path: &Path) -> Result<CString> {
+    let path_str = path.to_string_lossy();
+    CString::new(path_str.as_bytes())
+        .map_err(|_| format!("path contains NUL byte: {}", path.display()))
 }
 
-fn announce_track_start(ctx: &DecodeContext, track: &TrackSpan) {
-    let output_display =
-        crate::cli::display_path(ctx.display_base_abs.as_deref(), &track.output_path);
+fn announce_track_start(
+    display_base_abs: Option<&Path>,
+    progress: Option<&ProgressBar>,
+    track: &TrackSpan,
+) {
+    let output_display = display_path(display_base_abs, &track.output_path);
     let line = format!(
         "{} {}",
         "Creating".green().bold(),
         output_display.display().to_string().bold()
     );
-    if let Some(progress) = ctx.progress.as_ref() {
+    if let Some(progress) = progress {
         progress.println(line);
     } else {
         println!("{}", line);

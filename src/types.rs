@@ -1,5 +1,6 @@
-use libflac_sys as flac;
 use std::path::PathBuf;
+
+use crate::flac::FlacMetadata;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CueRem {
@@ -37,7 +38,7 @@ pub(crate) struct CueTrack {
     pub(crate) rem: CueRem,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct InputMetadata {
     pub(crate) sample_rate: u32,
     pub(crate) channels: u32,
@@ -45,7 +46,7 @@ pub(crate) struct InputMetadata {
     pub(crate) total_samples: u64,
     pub(crate) vendor: Option<String>,
     pub(crate) comments: Vec<(String, String)>,
-    pub(crate) pictures: Vec<*mut flac::FLAC__StreamMetadata>,
+    pub(crate) pictures: Vec<FlacMetadata>,
 }
 
 impl InputMetadata {

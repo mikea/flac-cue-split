@@ -55,6 +55,14 @@ pub(crate) fn parse_compression_level(value: &str) -> Result<u8> {
     Ok(level)
 }
 
+fn is_supported_audio_ext(ext: &str) -> bool {
+    matches!(ext, "flac" | "wv")
+}
+
+fn supported_audio_exts_label() -> &'static str {
+    ".flac/.wv"
+}
+
 pub(crate) fn resolve_input_path(
     base_dir_abs: &Path,
     display_base_abs: Option<&Path>,
@@ -77,6 +85,56 @@ pub(crate) fn resolve_input_path(
     let abs = resolve_or_find_file(base_dir_abs, None, extension)?;
     let display = display_path(display_base_abs, &abs);
     Ok(InputPath { abs, display })
+}
+
+fn resolve_audio_input_path(
+    base_dir_abs: &Path,
+    display_base_abs: Option<&Path>,
+    provided: Option<&PathBuf>,
+) -> Result<InputPath> {
+    if let Some(path) = provided {
+        let abs = if path.is_absolute() {
+            path.clone()
+        } else {
+            base_dir_abs.join(path)
+        };
+        if !abs.exists() {
+            return Err(format!("file not found: {}", abs.display()));
+        }
+        let ext = abs
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !is_supported_audio_ext(&ext) {
+            return Err(format!(
+                "unsupported audio input {} (expected {})",
+                abs.display(),
+                supported_audio_exts_label()
+            ));
+        }
+        let display = display_path(display_base_abs, &abs);
+        return Ok(InputPath { abs, display });
+    }
+
+    let matches = find_files_with_extensions(base_dir_abs, &["flac", "wv"])?;
+    match matches.len() {
+        0 => Err(format!(
+            "no {} file found in {}",
+            supported_audio_exts_label(),
+            base_dir_abs.display()
+        )),
+        1 => {
+            let abs = matches[0].clone();
+            let display = display_path(display_base_abs, &abs);
+            Ok(InputPath { abs, display })
+        }
+        _ => Err(format!(
+            "multiple {} files found in {}, please specify --flac",
+            supported_audio_exts_label(),
+            base_dir_abs.display()
+        )),
+    }
 }
 
 pub(crate) fn display_path(base: Option<&Path>, path: &Path) -> PathBuf {
@@ -154,7 +212,7 @@ pub(crate) fn resolve_matching_pairs(
         )
     })?;
 
-    let mut flac_by_stem = BTreeMap::<String, PathBuf>::new();
+    let mut audio_by_stem = BTreeMap::<String, PathBuf>::new();
     let mut cue_by_stem = BTreeMap::<String, PathBuf>::new();
 
     for entry in read_dir {
@@ -168,20 +226,20 @@ pub(crate) fn resolve_matching_pairs(
             Some(ext) => ext.to_ascii_lowercase(),
             None => continue,
         };
-        if ext != "flac" && ext != "cue" {
+        if !is_supported_audio_ext(&ext) && ext != "cue" {
             continue;
         }
 
         let stem = pairing_stem_for_extension(&path, &ext)?;
 
-        let target = if ext == "flac" {
-            &mut flac_by_stem
+        let target = if is_supported_audio_ext(&ext) {
+            &mut audio_by_stem
         } else {
             &mut cue_by_stem
         };
         if let Some(existing) = target.insert(stem.clone(), path.clone()) {
             return Err(format!(
-                "multiple .{} files with basename {:?}: {} and {}",
+                "multiple {} files with basename {:?}: {} and {}",
                 ext,
                 stem,
                 existing.display(),
@@ -190,22 +248,27 @@ pub(crate) fn resolve_matching_pairs(
         }
     }
 
-    if flac_by_stem.is_empty() {
-        return Err(format!("no .flac file found in {}", base_dir_abs.display()));
+    if audio_by_stem.is_empty() {
+        return Err(format!(
+            "no {} file found in {}",
+            supported_audio_exts_label(),
+            base_dir_abs.display()
+        ));
     }
     if cue_by_stem.is_empty() {
         return Err(format!("no .cue file found in {}", base_dir_abs.display()));
     }
-    if flac_by_stem.len() != cue_by_stem.len() {
+    if audio_by_stem.len() != cue_by_stem.len() {
         return Err(format!(
-            "found {} .flac files but {} .cue files in {}; counts must match",
-            flac_by_stem.len(),
+            "found {} {} files but {} .cue files in {}; counts must match",
+            audio_by_stem.len(),
+            supported_audio_exts_label(),
             cue_by_stem.len(),
             base_dir_abs.display()
         ));
     }
 
-    let missing_cue: Vec<&str> = flac_by_stem
+    let missing_cue: Vec<&str> = audio_by_stem
         .keys()
         .filter(|stem| !cue_by_stem.contains_key(*stem))
         .map(String::as_str)
@@ -217,20 +280,21 @@ pub(crate) fn resolve_matching_pairs(
         ));
     }
 
-    let missing_flac: Vec<&str> = cue_by_stem
+    let missing_audio: Vec<&str> = cue_by_stem
         .keys()
-        .filter(|stem| !flac_by_stem.contains_key(*stem))
+        .filter(|stem| !audio_by_stem.contains_key(*stem))
         .map(String::as_str)
         .collect();
-    if !missing_flac.is_empty() {
+    if !missing_audio.is_empty() {
         return Err(format!(
-            "missing .flac file(s) for basename(s): {}",
-            missing_flac.join(", ")
+            "missing {} file(s) for basename(s): {}",
+            supported_audio_exts_label(),
+            missing_audio.join(", ")
         ));
     }
 
-    let mut pairs = Vec::with_capacity(flac_by_stem.len());
-    for (stem, flac_abs) in flac_by_stem {
+    let mut pairs = Vec::with_capacity(audio_by_stem.len());
+    for (stem, flac_abs) in audio_by_stem {
         let cue_abs = cue_by_stem
             .get(&stem)
             .ok_or_else(|| format!("missing .cue file for basename {}", stem))?
@@ -258,12 +322,12 @@ pub(crate) fn resolve_input_pairs(
 ) -> Result<Vec<InputPair>> {
     if flac.is_some() || cue.is_some() {
         return Ok(vec![InputPair {
-            flac: resolve_input_path(base_dir_abs, display_base_abs, flac, "flac")?,
+            flac: resolve_audio_input_path(base_dir_abs, display_base_abs, flac)?,
             cue: resolve_input_path(base_dir_abs, display_base_abs, cue, "cue")?,
         }]);
     }
 
-    let flacs = find_files_with_extension(base_dir_abs, "flac")?;
+    let flacs = find_files_with_extensions(base_dir_abs, &["flac", "wv"])?;
     let cues = find_files_with_extension(base_dir_abs, "cue")?;
     if flacs.len() == 1 && cues.len() == 1 {
         let flac_abs = flacs[0].clone();
@@ -284,6 +348,10 @@ pub(crate) fn resolve_input_pairs(
 }
 
 fn find_files_with_extension(base_dir_abs: &Path, extension: &str) -> Result<Vec<PathBuf>> {
+    find_files_with_extensions(base_dir_abs, &[extension])
+}
+
+fn find_files_with_extensions(base_dir_abs: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
     let mut matches = Vec::new();
     let read_dir = std::fs::read_dir(base_dir_abs).map_err(|err| {
         format!(
@@ -303,7 +371,7 @@ fn find_files_with_extension(base_dir_abs: &Path, extension: &str) -> Result<Vec
             Some(ext) => ext.to_ascii_lowercase(),
             None => continue,
         };
-        if ext == extension {
+        if extensions.iter().any(|candidate| ext == *candidate) {
             matches.push(path);
         }
     }
@@ -369,6 +437,27 @@ mod tests {
         assert_eq!(
             pairs[0].cue.abs.file_name().unwrap().to_string_lossy(),
             "Different Name.wv.cue"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_input_pairs_supports_single_wv_and_cue() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Album.wv"), b"").unwrap();
+        fs::write(dir.join("Album.cue"), b"").unwrap();
+
+        let pairs = resolve_input_pairs(&dir, Some(&dir), None, None).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            pairs[0].flac.abs.file_name().unwrap().to_string_lossy(),
+            "Album.wv"
+        );
+        assert_eq!(
+            pairs[0].cue.abs.file_name().unwrap().to_string_lossy(),
+            "Album.cue"
         );
 
         fs::remove_dir_all(&dir).unwrap();

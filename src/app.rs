@@ -7,8 +7,8 @@ use crate::Result;
 use crate::cli::{Args, InputPair, resolve_input_pairs};
 use crate::cue::report_cue_warnings;
 use crate::cue::resolve_encoding;
-use crate::flac::{SplitOptions, prepare_split, sanitize_filename};
 use crate::output::{confirm_or_exit, print_plan};
+use crate::split::{SplitOptions, prepare_split, sanitize_filename};
 
 pub fn run() -> Result<()> {
     let args = Args::parse();
@@ -79,17 +79,7 @@ pub fn run() -> Result<()> {
             println!("{}", format!("Pair {}/{}", index + 1, total).bold().blue());
         }
         report_cue_warnings(prepared.warnings());
-        let (encoding_used, encoding_autodetected) = prepared.cue_encoding();
-        let (delete_original, rename_original) = prepared.source_actions();
-        print_plan(
-            prepared.context(),
-            prepared.flac_display(),
-            prepared.cue_display(),
-            encoding_used,
-            encoding_autodetected,
-            delete_original,
-            rename_original,
-        )?;
+        print_plan(prepared)?;
     }
 
     if !confirm_or_exit(args.yes)? {
@@ -118,7 +108,7 @@ fn derive_output_subdirs(pairs: &[InputPair]) -> Result<Vec<Option<PathBuf>>> {
                 .map(|stem| stem.to_string())
                 .ok_or_else(|| {
                     format!(
-                        "failed to derive basename from FLAC path: {}",
+                        "failed to derive basename from input path: {}",
                         pair.flac.abs.display()
                     )
                 })

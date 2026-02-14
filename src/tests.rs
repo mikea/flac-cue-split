@@ -1,5 +1,5 @@
 use crate::cue::parse_cue_from_str;
-use crate::flac::{compute_track_spans, frames_to_samples, sanitize_filename};
+use crate::split::{compute_track_spans, frames_to_samples, sanitize_filename};
 
 #[test]
 fn frames_to_samples_44100() {

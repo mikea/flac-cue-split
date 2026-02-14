@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
+use crate::flac::FlacMetadata;
 use crate::types::InputMetadata;
 
 pub(crate) fn add_external_picture(
@@ -26,6 +27,20 @@ pub(crate) fn add_external_picture(
         picture_names.push(name.to_string_lossy().into_owned());
     }
     Ok(())
+}
+
+pub(crate) fn build_picture_metadata_from_data(
+    data: &[u8],
+    filename_hint: Option<&str>,
+) -> Result<FlacMetadata> {
+    if data.is_empty() {
+        return Err("embedded picture is empty".to_string());
+    }
+
+    let mime =
+        picture_mime_type_from_name(filename_hint).or_else(|| picture_mime_type_from_data(data));
+    let mime = mime.ok_or_else(|| "unsupported embedded picture type".to_string())?;
+    create_picture_metadata(data, mime)
 }
 
 fn find_picture_file(dir: &Path) -> Result<Option<PathBuf>> {
@@ -64,27 +79,23 @@ fn matches_picture_extension(ext: &str) -> bool {
     )
 }
 
-fn load_picture_metadata(path: &Path) -> Result<*mut flac::FLAC__StreamMetadata> {
+fn load_picture_metadata(path: &Path) -> Result<FlacMetadata> {
     let data = fs::read(path)
         .map_err(|err| format!("failed to read picture {}: {}", path.display(), err))?;
-    if data.is_empty() {
-        return Err(format!("picture {} is empty", path.display()));
-    }
+    let mime = picture_mime_type(path).or_else(|| picture_mime_type_from_data(&data));
+    let mime = mime.ok_or_else(|| format!("unsupported picture type: {}", path.display()))?;
+    create_picture_metadata(&data, mime)
+}
 
-    let mime = picture_mime_type(path)
-        .ok_or_else(|| format!("unsupported picture type: {}", path.display()))?;
-
-    let object = unsafe { flac::FLAC__metadata_object_new(flac::FLAC__METADATA_TYPE_PICTURE) };
-    if object.is_null() {
-        return Err("failed to allocate picture metadata".to_string());
-    }
+fn create_picture_metadata(data: &[u8], mime: &str) -> Result<FlacMetadata> {
+    let mut object = FlacMetadata::new(flac::FLAC__METADATA_TYPE_PICTURE)?;
 
     let mime_c =
         CString::new(mime).map_err(|_| format!("picture mime type contains NUL: {}", mime))?;
     let desc_c = CString::new("").map_err(|_| "picture description contains NUL".to_string())?;
 
-    unsafe {
-        let picture = &mut (*object).data.picture;
+    {
+        let picture = unsafe { &mut object.as_mut().data.picture };
         picture.type_ = flac::FLAC__STREAM_METADATA_PICTURE_TYPE_FRONT_COVER;
         picture.width = 0;
         picture.height = 0;
@@ -93,55 +104,49 @@ fn load_picture_metadata(path: &Path) -> Result<*mut flac::FLAC__StreamMetadata>
     }
 
     let ok = unsafe {
-        flac::FLAC__metadata_object_picture_set_mime_type(object, mime_c.as_ptr() as *mut _, 1) != 0
+        flac::FLAC__metadata_object_picture_set_mime_type(
+            object.as_mut_ptr(),
+            mime_c.as_ptr() as *mut _,
+            1,
+        ) != 0
     };
     if !ok {
-        unsafe {
-            flac::FLAC__metadata_object_delete(object);
-        }
         return Err("failed to set picture mime type".to_string());
     }
 
     let ok = unsafe {
         flac::FLAC__metadata_object_picture_set_description(
-            object,
+            object.as_mut_ptr(),
             desc_c.as_ptr() as *mut flac::FLAC__byte,
             1,
         ) != 0
     };
     if !ok {
-        unsafe {
-            flac::FLAC__metadata_object_delete(object);
-        }
         return Err("failed to set picture description".to_string());
     }
 
     let ok = unsafe {
         flac::FLAC__metadata_object_picture_set_data(
-            object,
+            object.as_mut_ptr(),
             data.as_ptr() as *mut flac::FLAC__byte,
             data.len() as u32,
             1,
         ) != 0
     };
     if !ok {
-        unsafe {
-            flac::FLAC__metadata_object_delete(object);
-        }
         return Err("failed to set picture data".to_string());
     }
 
     let mut violation: *const i8 = std::ptr::null();
-    let ok = unsafe { flac::FLAC__metadata_object_picture_is_legal(object, &mut violation) != 0 };
+    let ok = unsafe {
+        flac::FLAC__metadata_object_picture_is_legal(object.as_mut_ptr(), &mut violation) != 0
+    };
     if !ok {
         let msg = if violation.is_null() {
             "picture metadata is invalid".to_string()
         } else {
             unsafe { CStr::from_ptr(violation).to_string_lossy().into_owned() }
         };
-        unsafe {
-            flac::FLAC__metadata_object_delete(object);
-        }
         return Err(msg);
     }
 
@@ -149,7 +154,13 @@ fn load_picture_metadata(path: &Path) -> Result<*mut flac::FLAC__StreamMetadata>
 }
 
 fn picture_mime_type(path: &Path) -> Option<&'static str> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    picture_mime_type_from_name(path.file_name().and_then(|name| name.to_str()))
+}
+
+fn picture_mime_type_from_name(name: Option<&str>) -> Option<&'static str> {
+    let name = name?;
+    let (_, ext) = name.rsplit_once('.')?;
+    let ext = ext.to_ascii_lowercase();
     match ext.as_str() {
         "jpg" | "jpeg" => Some("image/jpeg"),
         "png" => Some("image/png"),
@@ -159,4 +170,29 @@ fn picture_mime_type(path: &Path) -> Option<&'static str> {
         "tif" | "tiff" => Some("image/tiff"),
         _ => None,
     }
+}
+
+fn picture_mime_type_from_data(data: &[u8]) -> Option<&'static str> {
+    if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+        return Some("image/jpeg");
+    }
+    if data.len() >= 8 && data[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        return Some("image/png");
+    }
+    if data.len() >= 6 && (&data[0..6] == b"GIF87a" || &data[0..6] == b"GIF89a") {
+        return Some("image/gif");
+    }
+    if data.len() >= 4 && &data[0..4] == b"RIFF" && data.len() >= 12 && &data[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if data.len() >= 2
+        && ((data[0] == b'I' && data[1] == b'I') || (data[0] == b'M' && data[1] == b'M'))
+    {
+        return Some("image/tiff");
+    }
+    if data.len() >= 2 && data[0] == b'B' && data[1] == b'M' {
+        return Some("image/bmp");
+    }
+
+    None
 }

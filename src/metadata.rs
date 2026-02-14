@@ -2,6 +2,7 @@ use libflac_sys as flac;
 use std::collections::{HashMap, HashSet};
 
 use crate::Result;
+use crate::flac::FlacMetadata;
 use crate::types::{CueDisc, InputMetadata, TrackSpan};
 
 pub(crate) fn build_track_metadata(
@@ -9,15 +10,14 @@ pub(crate) fn build_track_metadata(
     cue: &CueDisc,
     tracks: &[TrackSpan],
     track: &TrackSpan,
-) -> Result<Vec<*mut flac::FLAC__StreamMetadata>> {
+) -> Result<Vec<FlacMetadata>> {
     let mut blocks = Vec::new();
 
     let comment = build_vorbis_comment(meta, cue, tracks, track)?;
     blocks.push(comment);
 
     for picture in &meta.pictures {
-        let clone = unsafe { flac::FLAC__metadata_object_clone(*picture as *const _) };
-        if !clone.is_null() {
+        if let Some(clone) = picture.try_clone() {
             blocks.push(clone);
         }
     }
@@ -30,37 +30,24 @@ fn build_vorbis_comment(
     cue: &CueDisc,
     tracks: &[TrackSpan],
     track: &TrackSpan,
-) -> Result<*mut flac::FLAC__StreamMetadata> {
-    let object =
-        unsafe { flac::FLAC__metadata_object_new(flac::FLAC__METADATA_TYPE_VORBIS_COMMENT) };
-    if object.is_null() {
-        return Err("failed to allocate Vorbis comment metadata".to_string());
-    }
+) -> Result<FlacMetadata> {
+    let mut object = FlacMetadata::new(flac::FLAC__METADATA_TYPE_VORBIS_COMMENT)
+        .map_err(|_| "failed to allocate Vorbis comment metadata".to_string())?;
 
     let vendor = meta.vendor.as_deref().unwrap_or("flac-cue-split");
-    if let Err(err) = set_vendor_string(object, vendor) {
-        unsafe {
-            flac::FLAC__metadata_object_delete(object);
-        }
-        return Err(err);
-    }
+    set_vendor_string(&mut object, vendor)?;
 
     let overrides = build_override_tags(cue, tracks.len(), track);
     let merged = merge_tags(&meta.comments, &overrides);
 
     for (key, value) in merged {
-        if let Err(err) = append_comment(object, &key, &value) {
-            unsafe {
-                flac::FLAC__metadata_object_delete(object);
-            }
-            return Err(err);
-        }
+        append_comment(&mut object, &key, &value)?;
     }
 
     Ok(object)
 }
 
-fn set_vendor_string(object: *mut flac::FLAC__StreamMetadata, vendor: &str) -> Result<()> {
+fn set_vendor_string(object: &mut FlacMetadata, vendor: &str) -> Result<()> {
     let bytes = vendor.as_bytes();
     let entry = flac::FLAC__StreamMetadata_VorbisComment_Entry {
         length: bytes.len() as u32,
@@ -68,7 +55,8 @@ fn set_vendor_string(object: *mut flac::FLAC__StreamMetadata, vendor: &str) -> R
     };
 
     let ok = unsafe {
-        flac::FLAC__metadata_object_vorbiscomment_set_vendor_string(object, entry, 1) != 0
+        flac::FLAC__metadata_object_vorbiscomment_set_vendor_string(object.as_mut_ptr(), entry, 1)
+            != 0
     };
     if !ok {
         return Err("failed to set Vorbis vendor string".to_string());
@@ -76,7 +64,7 @@ fn set_vendor_string(object: *mut flac::FLAC__StreamMetadata, vendor: &str) -> R
     Ok(())
 }
 
-fn append_comment(object: *mut flac::FLAC__StreamMetadata, key: &str, value: &str) -> Result<()> {
+fn append_comment(object: &mut FlacMetadata, key: &str, value: &str) -> Result<()> {
     let comment = format!("{}={}", key, value);
     let bytes = comment.as_bytes();
     let entry = flac::FLAC__StreamMetadata_VorbisComment_Entry {
@@ -84,8 +72,9 @@ fn append_comment(object: *mut flac::FLAC__StreamMetadata, key: &str, value: &st
         entry: bytes.as_ptr() as *mut flac::FLAC__byte,
     };
 
-    let ok =
-        unsafe { flac::FLAC__metadata_object_vorbiscomment_append_comment(object, entry, 1) != 0 };
+    let ok = unsafe {
+        flac::FLAC__metadata_object_vorbiscomment_append_comment(object.as_mut_ptr(), entry, 1) != 0
+    };
     if !ok {
         return Err(format!("failed to append Vorbis comment {}", key));
     }
