@@ -652,6 +652,11 @@ fn handle_original_flac(
                 err
             )
         })?;
+        println!(
+            "{} {}",
+            "Deleted".red().bold(),
+            flac_path.display().to_string().red()
+        );
         return Ok(());
     }
 
@@ -666,6 +671,12 @@ fn handle_original_flac(
                 err
             )
         })?;
+        println!(
+            "{} {} -> {}",
+            "Renamed".yellow().bold(),
+            flac_path.display().to_string().yellow(),
+            renamed.display().to_string().yellow()
+        );
     }
 
     Ok(())
@@ -936,17 +947,12 @@ fn cleanup_metadata_blocks(blocks: &mut Vec<*mut flac::FLAC__StreamMetadata>) {
 }
 
 fn announce_track_start(ctx: &DecodeContext, track: &TrackSpan) {
-    let title = track
-        .title
-        .clone()
-        .unwrap_or_else(|| format!("Track {}", track.number));
-    let line = format!(
-        "{} {:02} - {} -> {}",
-        "Creating".green().bold(),
-        track.number,
-        title,
-        crate::cli::display_path(ctx.display_base_abs.as_deref(), &track.output_path).display()
-    );
+    let file_name = track
+        .output_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| track.output_path.display().to_string());
+    let line = format!("{} {}", "Creating".green().bold(), file_name.bold());
     if let Some(progress) = ctx.progress.as_ref() {
         progress.println(line);
     } else {
