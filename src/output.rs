@@ -77,10 +77,7 @@ pub(crate) fn print_plan(
         let length_frames = end_frames.saturating_sub(start_frames);
 
         let output_display = display_path(context.display_base_abs.as_deref(), &track.output_path);
-        let file_name = output_display
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| output_display.display().to_string());
+        let output_target = format_output_target(&output_display);
         let length = format_msf(length_frames);
         let range = format!("({}-{})", format_msf(start_frames), format_msf(end_frames));
         let unique_metadata = compute_unique_metadata_pairs(
@@ -94,13 +91,13 @@ pub(crate) fn print_plan(
         if tags.is_empty() {
             println!(
                 "{} {}",
-                file_name.bold(),
+                output_target,
                 format!("{} {}", length, range).dimmed()
             );
         } else {
             println!(
                 "{} {} {}",
-                file_name.bold(),
+                output_target,
                 format!("{} {}", length, range).dimmed(),
                 tags
             );
@@ -108,6 +105,32 @@ pub(crate) fn print_plan(
     }
 
     Ok(())
+}
+
+fn format_output_target(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent
+        && parent != Path::new(".")
+    {
+        let separator = if parent == Path::new(std::path::MAIN_SEPARATOR_STR) {
+            ""
+        } else {
+            std::path::MAIN_SEPARATOR_STR
+        };
+        return format!(
+            "{}{}{}",
+            parent.display().to_string().blue(),
+            separator,
+            file_name.bold()
+        );
+    }
+    file_name.bold().to_string()
 }
 
 fn print_shared_metadata(common: &[(String, String)], pictures: usize, picture_names: &[String]) {

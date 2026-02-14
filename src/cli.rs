@@ -254,3 +254,19 @@ pub(crate) fn resolve_matching_pairs(
 
     Ok(pairs)
 }
+
+pub(crate) fn resolve_input_pairs(
+    base_dir_abs: &Path,
+    display_base_abs: Option<&Path>,
+    flac: Option<&PathBuf>,
+    cue: Option<&PathBuf>,
+) -> Result<Vec<InputPair>> {
+    if flac.is_some() || cue.is_some() {
+        return Ok(vec![InputPair {
+            flac: resolve_input_path(base_dir_abs, display_base_abs, flac, "flac")?,
+            cue: resolve_input_path(base_dir_abs, display_base_abs, cue, "cue")?,
+        }]);
+    }
+
+    resolve_matching_pairs(base_dir_abs, display_base_abs)
+}

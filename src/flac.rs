@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::cli::InputPath;
-use crate::cue::{parse_cue_file, report_cue_warnings};
+use crate::cue::parse_cue_file;
 use crate::metadata::{build_track_metadata, parse_vorbis_comment};
-use crate::output::{confirm_or_exit, finish_progress, make_progress_bar, print_plan};
+use crate::output::{finish_progress, make_progress_bar};
 use crate::picture::add_external_picture;
 use crate::types::{CueDisc, CueRem, InputMetadata, TrackSpan};
 
@@ -20,7 +20,6 @@ pub(crate) struct SplitOptions {
     pub(crate) cue_input: InputPath,
     pub(crate) display_base_abs: Option<PathBuf>,
     pub(crate) cue_encoding: Option<&'static Encoding>,
-    pub(crate) yes: bool,
     pub(crate) overwrite: bool,
     pub(crate) compression_level: u8,
     pub(crate) search_dir: PathBuf,
@@ -31,10 +30,95 @@ pub(crate) struct SplitOptions {
     pub(crate) output_subdir: Option<PathBuf>,
 }
 
-pub(crate) fn split_flac(options: SplitOptions) -> Result<()> {
+pub(crate) struct PreparedSplit {
+    context: DecodeContext,
+    decoder: *mut flac::FLAC__StreamDecoder,
+    total_samples: u64,
+    warnings: Vec<String>,
+    flac_display: PathBuf,
+    cue_display: PathBuf,
+    flac_abs: PathBuf,
+    overwrite: bool,
+    delete_original: bool,
+    rename_original: bool,
+    encoding_used: &'static Encoding,
+    encoding_autodetected: bool,
+}
+
+impl PreparedSplit {
+    pub(crate) fn context(&self) -> &DecodeContext {
+        &self.context
+    }
+
+    pub(crate) fn flac_display(&self) -> &Path {
+        &self.flac_display
+    }
+
+    pub(crate) fn cue_display(&self) -> &Path {
+        &self.cue_display
+    }
+
+    pub(crate) fn cue_encoding(&self) -> (&'static Encoding, bool) {
+        (self.encoding_used, self.encoding_autodetected)
+    }
+
+    pub(crate) fn source_actions(&self) -> (bool, bool) {
+        (self.delete_original, self.rename_original)
+    }
+
+    pub(crate) fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    pub(crate) fn execute(mut self) -> Result<()> {
+        let progress = make_progress_bar(self.total_samples);
+        self.context.progress = Some(progress.clone());
+
+        ensure_output_paths_available(&self.context.tracks, self.overwrite)?;
+
+        let ok = unsafe { flac::FLAC__stream_decoder_process_until_end_of_stream(self.decoder) };
+        if ok == 0 {
+            let error = self
+                .context
+                .error
+                .take()
+                .unwrap_or_else(|| "FLAC decoding failed".to_string());
+            finish_progress(&mut self.context, "aborted");
+            return Err(error);
+        }
+
+        if let Err(error) = self.context.finish_encoder() {
+            finish_progress(&mut self.context, "aborted");
+            return Err(error);
+        }
+
+        finish_progress(&mut self.context, "done");
+        self.finish_decoder();
+        self.context.cleanup();
+        handle_original_flac(&self.flac_abs, self.delete_original, self.rename_original)
+    }
+
+    fn finish_decoder(&mut self) {
+        if !self.decoder.is_null() {
+            unsafe {
+                flac::FLAC__stream_decoder_finish(self.decoder);
+                flac::FLAC__stream_decoder_delete(self.decoder);
+            }
+            self.decoder = std::ptr::null_mut();
+        }
+    }
+}
+
+impl Drop for PreparedSplit {
+    fn drop(&mut self) {
+        self.finish_decoder();
+        self.context.cleanup();
+    }
+}
+
+pub(crate) fn prepare_split(options: SplitOptions) -> Result<PreparedSplit> {
     let (cue, warnings, encoding_used, encoding_autodetected) =
         parse_cue_file(&options.cue_input.abs, options.cue_encoding)?;
-    report_cue_warnings(&warnings);
     validate_cue_files(&cue, &options.flac_input.abs)?;
 
     let mut output_dir = options
@@ -124,67 +208,20 @@ pub(crate) fn split_flac(options: SplitOptions) -> Result<()> {
     }
 
     context.prepare_tracks(sample_rate, total_samples, false)?;
-    print_plan(
-        &context,
-        &options.flac_input.display,
-        &options.cue_input.display,
+    Ok(PreparedSplit {
+        context,
+        decoder,
+        total_samples,
+        warnings,
+        flac_display: options.flac_input.display,
+        cue_display: options.cue_input.display,
+        flac_abs: options.flac_input.abs,
+        overwrite: options.overwrite,
+        delete_original: options.delete_original,
+        rename_original: options.rename_original,
         encoding_used,
         encoding_autodetected,
-        options.delete_original,
-        options.rename_original,
-    )?;
-    if !confirm_or_exit(options.yes)? {
-        unsafe {
-            flac::FLAC__stream_decoder_finish(decoder);
-            flac::FLAC__stream_decoder_delete(decoder);
-        }
-        context.cleanup();
-        return Ok(());
-    }
-
-    let progress = make_progress_bar(total_samples);
-    context.progress = Some(progress.clone());
-
-    ensure_output_paths_available(&context.tracks, options.overwrite)?;
-
-    let ok = unsafe { flac::FLAC__stream_decoder_process_until_end_of_stream(decoder) };
-    if ok == 0 {
-        let error = context
-            .error
-            .take()
-            .unwrap_or_else(|| "FLAC decoding failed".to_string());
-        finish_progress(&mut context, "aborted");
-        unsafe {
-            flac::FLAC__stream_decoder_finish(decoder);
-            flac::FLAC__stream_decoder_delete(decoder);
-        }
-        return Err(error);
-    }
-
-    if let Err(error) = context.finish_encoder() {
-        finish_progress(&mut context, "aborted");
-        unsafe {
-            flac::FLAC__stream_decoder_finish(decoder);
-            flac::FLAC__stream_decoder_delete(decoder);
-        }
-        return Err(error);
-    }
-
-    unsafe {
-        flac::FLAC__stream_decoder_finish(decoder);
-        flac::FLAC__stream_decoder_delete(decoder);
-    }
-
-    finish_progress(&mut context, "done");
-    context.cleanup();
-
-    handle_original_flac(
-        &options.flac_input.abs,
-        options.delete_original,
-        options.rename_original,
-    )?;
-
-    Ok(())
+    })
 }
 
 fn path_to_cstring(path: &Path) -> Result<CString> {

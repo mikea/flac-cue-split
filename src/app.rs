@@ -1,11 +1,14 @@
 use clap::Parser;
+use owo_colors::OwoColorize;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::Result;
-use crate::cli::{Args, InputPair, resolve_input_path, resolve_matching_pairs};
+use crate::cli::{Args, InputPair, resolve_input_pairs};
+use crate::cue::report_cue_warnings;
 use crate::cue::resolve_encoding;
-use crate::flac::{SplitOptions, sanitize_filename, split_flac};
+use crate::flac::{SplitOptions, prepare_split, sanitize_filename};
+use crate::output::{confirm_or_exit, print_plan};
 
 pub fn run() -> Result<()> {
     let args = Args::parse();
@@ -37,34 +40,23 @@ pub fn run() -> Result<()> {
         None
     };
 
-    let pairs = if args.flac.is_some() || args.cue.is_some() {
-        vec![InputPair {
-            flac: resolve_input_path(
-                &base_dir_abs,
-                display_base_abs.as_deref(),
-                args.flac.as_ref(),
-                "flac",
-            )?,
-            cue: resolve_input_path(
-                &base_dir_abs,
-                display_base_abs.as_deref(),
-                args.cue.as_ref(),
-                "cue",
-            )?,
-        }]
-    } else {
-        resolve_matching_pairs(&base_dir_abs, display_base_abs.as_deref())?
-    };
+    let pairs = resolve_input_pairs(
+        &base_dir_abs,
+        display_base_abs.as_deref(),
+        args.flac.as_ref(),
+        args.cue.as_ref(),
+    )?;
 
     let output_subdirs = derive_output_subdirs(&pairs)?;
+    let total = pairs.len();
+    let mut prepared_jobs = Vec::with_capacity(total);
 
     for (pair, output_subdir) in pairs.into_iter().zip(output_subdirs.into_iter()) {
-        let options = SplitOptions {
+        let prepared = prepare_split(SplitOptions {
             flac_input: pair.flac,
             cue_input: pair.cue,
             display_base_abs: display_base_abs.clone(),
             cue_encoding: encoding,
-            yes: args.yes,
             overwrite: args.overwrite,
             compression_level: args.compression_level,
             search_dir: base_dir_abs.clone(),
@@ -73,9 +65,37 @@ pub fn run() -> Result<()> {
             delete_original: args.delete_original,
             rename_original: args.rename_original,
             output_subdir,
-        };
+        })?;
+        prepared_jobs.push(prepared);
+    }
 
-        split_flac(options)?;
+    for (index, prepared) in prepared_jobs.iter().enumerate() {
+        if total > 1 {
+            if index > 0 {
+                println!();
+            }
+            println!("{}", format!("Pair {}/{}", index + 1, total).bold().blue());
+        }
+        report_cue_warnings(prepared.warnings());
+        let (encoding_used, encoding_autodetected) = prepared.cue_encoding();
+        let (delete_original, rename_original) = prepared.source_actions();
+        print_plan(
+            prepared.context(),
+            prepared.flac_display(),
+            prepared.cue_display(),
+            encoding_used,
+            encoding_autodetected,
+            delete_original,
+            rename_original,
+        )?;
+    }
+
+    if !confirm_or_exit(args.yes)? {
+        return Ok(());
+    }
+
+    for prepared in prepared_jobs {
+        prepared.execute()?;
     }
 
     Ok(())
