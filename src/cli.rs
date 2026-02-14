@@ -24,6 +24,10 @@ pub(crate) struct Args {
     pub(crate) picture: Option<PathBuf>,
     #[arg(long, conflicts_with = "picture")]
     pub(crate) no_picture: bool,
+    #[arg(long, conflicts_with = "rename_original")]
+    pub(crate) delete_original: bool,
+    #[arg(short = 'r', long, conflicts_with = "delete_original")]
+    pub(crate) rename_original: bool,
 }
 
 pub(crate) struct InputPath {
@@ -70,13 +74,13 @@ pub(crate) fn resolve_input_path(
 }
 
 pub(crate) fn display_path(base: Option<&Path>, path: &Path) -> PathBuf {
-    if let Some(base) = base {
-        if let Ok(rel) = path.strip_prefix(base) {
-            if rel.as_os_str().is_empty() {
-                return PathBuf::from(".");
-            }
-            return rel.to_path_buf();
+    if let Some(base) = base
+        && let Ok(rel) = path.strip_prefix(base)
+    {
+        if rel.as_os_str().is_empty() {
+            return PathBuf::from(".");
         }
+        return rel.to_path_buf();
     }
     path.to_path_buf()
 }

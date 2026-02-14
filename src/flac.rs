@@ -26,6 +26,8 @@ pub(crate) struct SplitOptions {
     pub(crate) search_dir: PathBuf,
     pub(crate) picture_enabled: bool,
     pub(crate) picture_path: Option<PathBuf>,
+    pub(crate) delete_original: bool,
+    pub(crate) rename_original: bool,
 }
 
 pub(crate) fn split_flac(options: SplitOptions) -> Result<()> {
@@ -117,6 +119,8 @@ pub(crate) fn split_flac(options: SplitOptions) -> Result<()> {
         &options.cue_input.display,
         encoding_used,
         encoding_autodetected,
+        options.delete_original,
+        options.rename_original,
     )?;
     if !confirm_or_exit(options.yes)? {
         unsafe {
@@ -162,6 +166,13 @@ pub(crate) fn split_flac(options: SplitOptions) -> Result<()> {
 
     finish_progress(&mut context, "done");
     context.cleanup();
+
+    handle_original_flac(
+        &options.flac_input.abs,
+        options.delete_original,
+        options.rename_original,
+    )?;
+
     Ok(())
 }
 
@@ -372,7 +383,7 @@ pub(crate) fn compute_track_spans(
     if sample_rate == 0 {
         return Err("FLAC sample rate is zero".to_string());
     }
-    if sample_rate % 75 != 0 {
+    if !sample_rate.is_multiple_of(75) {
         return Err(format!(
             "sample rate {} is not divisible by 75 (CUE frames)",
             sample_rate
@@ -430,7 +441,7 @@ pub(crate) fn frames_to_samples(frames: i64, sample_rate: u32) -> Result<u64> {
     if frames < 0 {
         return Err("negative frame count in cue sheet".to_string());
     }
-    if sample_rate % 75 != 0 {
+    if !sample_rate.is_multiple_of(75) {
         return Err(format!(
             "sample rate {} is not divisible by 75",
             sample_rate
@@ -514,6 +525,43 @@ fn ensure_output_paths_available(tracks: &[TrackSpan], overwrite: bool) -> Resul
             }
         }
     }
+    Ok(())
+}
+
+pub(crate) fn processed_flac_path(flac_path: &Path) -> Option<PathBuf> {
+    let file_name = flac_path.file_name()?.to_str()?;
+    Some(flac_path.with_file_name(format!("{}.processed", file_name)))
+}
+
+fn handle_original_flac(
+    flac_path: &Path,
+    delete_original: bool,
+    rename_original: bool,
+) -> Result<()> {
+    if delete_original {
+        fs::remove_file(flac_path).map_err(|err| {
+            format!(
+                "split succeeded, but failed to delete original file {}: {}",
+                flac_path.display(),
+                err
+            )
+        })?;
+        return Ok(());
+    }
+
+    if rename_original {
+        let renamed = processed_flac_path(flac_path)
+            .ok_or_else(|| format!("failed to rename original file: {}", flac_path.display()))?;
+        fs::rename(flac_path, &renamed).map_err(|err| {
+            format!(
+                "split succeeded, but failed to rename original file {} -> {}: {}",
+                flac_path.display(),
+                renamed.display(),
+                err
+            )
+        })?;
+    }
+
     Ok(())
 }
 
@@ -652,11 +700,11 @@ unsafe extern "C" fn decoder_write_callback(
         };
 
         interleave_samples(buffer, local_offset, take, &mut ctx.interleaved, channels);
-        if let Some(encoder) = ctx.encoder.as_mut() {
-            if let Err(err) = encoder.write_interleaved(&ctx.interleaved, take as u32) {
-                ctx.error = Some(err);
-                return flac::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-            }
+        if let Some(encoder) = ctx.encoder.as_mut()
+            && let Err(err) = encoder.write_interleaved(&ctx.interleaved, take as u32)
+        {
+            ctx.error = Some(err);
+            return flac::FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
         }
 
         block_start += take as u64;

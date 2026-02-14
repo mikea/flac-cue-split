@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::Result;
 use crate::cli::display_path;
-use crate::flac::DecodeContext;
+use crate::flac::{DecodeContext, processed_flac_path};
 use crate::metadata::{compute_common_metadata, compute_unique_metadata_pairs};
 
 pub(crate) fn print_plan(
@@ -15,6 +15,8 @@ pub(crate) fn print_plan(
     cue_path: &Path,
     cue_encoding: &'static Encoding,
     cue_encoding_autodetected: bool,
+    delete_original: bool,
+    rename_original: bool,
 ) -> Result<()> {
     let meta = context
         .input_meta
@@ -35,6 +37,19 @@ pub(crate) fn print_plan(
 
     println!("{}", "Plan".bold());
     println!("  {} {}", "FLAC:".cyan(), flac_path.display());
+    if delete_original {
+        println!(
+            "  {} {}",
+            "Source action:".cyan(),
+            "will be deleted after successful split".red().bold()
+        );
+    } else if rename_original {
+        let rename_note = match processed_flac_path(flac_path) {
+            Some(renamed) => format!("will be renamed to {}", renamed.display()),
+            None => "will be renamed after successful split".to_string(),
+        };
+        println!("  {} {}", "Source action:".cyan(), rename_note.yellow());
+    }
     println!("  {} {}", "CUE:".cyan(), cue_path.display());
     let encoding_label = if cue_encoding_autodetected {
         format!("{} {}", cue_encoding.name(), "(autodetected)".dimmed())

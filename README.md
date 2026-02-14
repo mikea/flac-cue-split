@@ -67,6 +67,18 @@ Disable picture auto-detect:
 flac-cue-split --no-picture
 ```
 
+Delete original FLAC after successful split:
+
+```bash
+flac-cue-split --delete-original
+```
+
+Rename original FLAC after successful split:
+
+```bash
+flac-cue-split -r
+```
+
 Force cue encoding:
 
 ```bash
@@ -82,6 +94,8 @@ flac-cue-split --cue-encoding windows-1251
 - If `--picture <FILE>` is provided, that file is embedded as the cover image.
 - Otherwise, if there is exactly one image file in the chosen directory (jpg/jpeg/png/gif/bmp/webp/tif/tiff), it is embedded as a cover picture in all output files (unless `--no-picture` is used).
 - Cue encoding is auto-detected (UTF-8, otherwise Windows-1251) and shown in the plan. You can override it with `--cue-encoding`.
+- `--delete-original` removes the input FLAC after a successful split.
+- `--rename-original` (or `-r`) renames the input FLAC to `*.flac.processed` after a successful split.
 
 ## Options
 
@@ -93,4 +107,6 @@ flac-cue-split --cue-encoding windows-1251
 - `-c, --compression-level <LEVEL>`: FLAC compression level (0-8 or `max`)
 - `--picture <FILE>`: Use a specific picture file
 - `--no-picture`: Disable picture auto-detection
+- `--delete-original`: Delete input FLAC after successful split
+- `-r, --rename-original`: Rename input FLAC to `*.flac.processed` after successful split
 - `DIR`: Optional directory to scan for input files

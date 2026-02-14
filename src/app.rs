@@ -59,6 +59,8 @@ pub fn run() -> Result<()> {
         search_dir: base_dir_abs,
         picture_enabled,
         picture_path,
+        delete_original: args.delete_original,
+        rename_original: args.rename_original,
     };
 
     split_flac(options)
