@@ -31,8 +31,7 @@ pub(crate) struct SplitOptions {
 }
 
 pub(crate) struct PreparedSplit {
-    context: DecodeContext,
-    decoder: *mut flac::FLAC__StreamDecoder,
+    context: Box<DecodeContext>,
     total_samples: u64,
     warnings: Vec<String>,
     flac_display: PathBuf,
@@ -47,7 +46,7 @@ pub(crate) struct PreparedSplit {
 
 impl PreparedSplit {
     pub(crate) fn context(&self) -> &DecodeContext {
-        &self.context
+        self.context.as_ref()
     }
 
     pub(crate) fn flac_display(&self) -> &Path {
@@ -71,12 +70,24 @@ impl PreparedSplit {
     }
 
     pub(crate) fn execute(mut self) -> Result<()> {
+        self.context.error = None;
+        self.context.progress = None;
+
         let progress = make_progress_bar(self.total_samples);
         self.context.progress = Some(progress.clone());
 
         ensure_output_paths_available(&self.context.tracks, self.overwrite)?;
 
-        let ok = unsafe { flac::FLAC__stream_decoder_process_until_end_of_stream(self.decoder) };
+        let mut decoder = Decoder::new()?;
+        decoder.init_file(
+            &self.flac_abs,
+            Some(decoder_write_callback),
+            None,
+            Some(decoder_error_callback),
+            &mut *self.context as *mut _ as *mut c_void,
+        )?;
+
+        let ok = decoder.process_until_end_of_stream();
         if ok == 0 {
             let error = self
                 .context
@@ -93,25 +104,13 @@ impl PreparedSplit {
         }
 
         finish_progress(&mut self.context, "done");
-        self.finish_decoder();
         self.context.cleanup();
         handle_original_flac(&self.flac_abs, self.delete_original, self.rename_original)
-    }
-
-    fn finish_decoder(&mut self) {
-        if !self.decoder.is_null() {
-            unsafe {
-                flac::FLAC__stream_decoder_finish(self.decoder);
-                flac::FLAC__stream_decoder_delete(self.decoder);
-            }
-            self.decoder = std::ptr::null_mut();
-        }
     }
 }
 
 impl Drop for PreparedSplit {
     fn drop(&mut self) {
-        self.finish_decoder();
         self.context.cleanup();
     }
 }
@@ -138,51 +137,29 @@ pub(crate) fn prepare_split(options: SplitOptions) -> Result<PreparedSplit> {
         )
     })?;
 
-    let mut context = DecodeContext::new(
+    let context = DecodeContext::new(
         cue,
         output_dir,
         options.compression_level,
         options.display_base_abs.clone(),
     );
+    let mut context = Box::new(context);
 
-    let decoder = unsafe { flac::FLAC__stream_decoder_new() };
-    if decoder.is_null() {
-        return Err("failed to create FLAC decoder".to_string());
-    }
+    let mut decoder = Decoder::new()?;
+    decoder.init_file(
+        &options.flac_input.abs,
+        Some(decoder_write_callback),
+        Some(decoder_metadata_callback),
+        Some(decoder_error_callback),
+        &mut *context as *mut _ as *mut c_void,
+    )?;
 
-    let flac_path_c = path_to_cstring(&options.flac_input.abs)?;
-    let init_status = unsafe {
-        flac::FLAC__stream_decoder_set_metadata_respond_all(decoder);
-        flac::FLAC__stream_decoder_init_file(
-            decoder,
-            flac_path_c.as_ptr(),
-            Some(decoder_write_callback),
-            Some(decoder_metadata_callback),
-            Some(decoder_error_callback),
-            &mut context as *mut _ as *mut c_void,
-        )
-    };
-
-    if init_status != flac::FLAC__STREAM_DECODER_INIT_STATUS_OK {
-        unsafe {
-            flac::FLAC__stream_decoder_delete(decoder);
-        }
-        return Err(format!(
-            "failed to init FLAC decoder (status {})",
-            init_status
-        ));
-    }
-
-    let ok = unsafe { flac::FLAC__stream_decoder_process_until_end_of_metadata(decoder) };
+    let ok = decoder.process_until_end_of_metadata();
     if ok == 0 {
         let error = context
             .error
             .take()
             .unwrap_or_else(|| "failed to read FLAC metadata".to_string());
-        unsafe {
-            flac::FLAC__stream_decoder_finish(decoder);
-            flac::FLAC__stream_decoder_delete(decoder);
-        }
         return Err(error);
     }
 
@@ -210,7 +187,6 @@ pub(crate) fn prepare_split(options: SplitOptions) -> Result<PreparedSplit> {
     context.prepare_tracks(sample_rate, total_samples, false)?;
     Ok(PreparedSplit {
         context,
-        decoder,
         total_samples,
         warnings,
         flac_display: options.flac_input.display,
@@ -228,6 +204,88 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
     let path_str = path.to_string_lossy();
     CString::new(path_str.as_bytes())
         .map_err(|_| format!("path contains NUL byte: {}", path.display()))
+}
+
+struct Decoder {
+    decoder: *mut flac::FLAC__StreamDecoder,
+}
+
+impl Decoder {
+    fn new() -> Result<Self> {
+        let decoder = unsafe { flac::FLAC__stream_decoder_new() };
+        if decoder.is_null() {
+            return Err("failed to create FLAC decoder".to_string());
+        }
+        Ok(Self { decoder })
+    }
+
+    fn init_file(
+        &mut self,
+        flac_path: &Path,
+        write_cb: Option<
+            unsafe extern "C" fn(
+                *const flac::FLAC__StreamDecoder,
+                *const flac::FLAC__Frame,
+                *const *const i32,
+                *mut c_void,
+            ) -> flac::FLAC__StreamDecoderWriteStatus,
+        >,
+        metadata_cb: Option<
+            unsafe extern "C" fn(
+                *const flac::FLAC__StreamDecoder,
+                *const flac::FLAC__StreamMetadata,
+                *mut c_void,
+            ),
+        >,
+        error_cb: Option<
+            unsafe extern "C" fn(
+                *const flac::FLAC__StreamDecoder,
+                flac::FLAC__StreamDecoderErrorStatus,
+                *mut c_void,
+            ),
+        >,
+        client_data: *mut c_void,
+    ) -> Result<()> {
+        let flac_path_c = path_to_cstring(flac_path)?;
+        let init_status = unsafe {
+            flac::FLAC__stream_decoder_set_metadata_respond_all(self.decoder);
+            flac::FLAC__stream_decoder_init_file(
+                self.decoder,
+                flac_path_c.as_ptr(),
+                write_cb,
+                metadata_cb,
+                error_cb,
+                client_data,
+            )
+        };
+        if init_status != flac::FLAC__STREAM_DECODER_INIT_STATUS_OK {
+            return Err(format!(
+                "failed to init FLAC decoder (status {})",
+                init_status
+            ));
+        }
+        Ok(())
+    }
+
+    fn process_until_end_of_metadata(&mut self) -> i32 {
+        unsafe { flac::FLAC__stream_decoder_process_until_end_of_metadata(self.decoder) }
+    }
+
+    fn process_until_end_of_stream(&mut self) -> i32 {
+        unsafe { flac::FLAC__stream_decoder_process_until_end_of_stream(self.decoder) }
+    }
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        if !self.decoder.is_null() {
+            unsafe {
+                flac::FLAC__stream_decoder_finish(self.decoder);
+                flac::FLAC__stream_decoder_delete(self.decoder);
+            }
+            self.decoder = std::ptr::null_mut();
+        }
+    }
 }
 
 fn validate_cue_files(cue: &CueDisc, flac_path: &Path) -> Result<()> {
