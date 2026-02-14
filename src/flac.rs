@@ -956,12 +956,13 @@ fn cleanup_metadata_blocks(blocks: &mut Vec<*mut flac::FLAC__StreamMetadata>) {
 }
 
 fn announce_track_start(ctx: &DecodeContext, track: &TrackSpan) {
-    let file_name = track
-        .output_path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| track.output_path.display().to_string());
-    let line = format!("{} {}", "Creating".green().bold(), file_name.bold());
+    let output_display =
+        crate::cli::display_path(ctx.display_base_abs.as_deref(), &track.output_path);
+    let line = format!(
+        "{} {}",
+        "Creating".green().bold(),
+        output_display.display().to_string().bold()
+    );
     if let Some(progress) = ctx.progress.as_ref() {
         progress.println(line);
     } else {
