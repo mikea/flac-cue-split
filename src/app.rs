@@ -123,7 +123,8 @@ fn derive_output_subdirs(pairs: &[InputPair]) -> Result<Vec<Option<PathBuf>>> {
         })
         .collect::<Result<Vec<String>>>()?;
     let stem_refs: Vec<&str> = stems.iter().map(String::as_str).collect();
-    let prefix_len = longest_common_prefix_len(&stem_refs);
+    let raw_prefix_len = longest_common_prefix_len(&stem_refs);
+    let prefix_len = adjust_common_prefix_len(&stem_refs, raw_prefix_len);
     let mut suffix_len = longest_common_suffix_len(&stem_refs);
     let max_suffix = stem_refs
         .iter()
@@ -179,6 +180,63 @@ fn longest_common_prefix_len(values: &[&str]) -> usize {
     prefix_len
 }
 
+fn adjust_common_prefix_len(values: &[&str], prefix_len: usize) -> usize {
+    if values.is_empty() || prefix_len == 0 {
+        return prefix_len;
+    }
+
+    let prefix = &values[0][..prefix_len];
+    let mut best = None;
+    for keyword in ["cd", "disk", "volume"] {
+        if let Some(start) = keyword_start_in_prefix(prefix, keyword) {
+            best = Some(best.map_or(start, |current: usize| current.max(start)));
+        }
+    }
+
+    best.unwrap_or(prefix_len)
+}
+
+fn keyword_start_in_prefix(prefix: &str, keyword: &str) -> Option<usize> {
+    let lowered = prefix.to_ascii_lowercase();
+    let mut offset = 0usize;
+    let mut found = None;
+
+    while offset < lowered.len() {
+        let rel = match lowered[offset..].find(keyword) {
+            Some(rel) => rel,
+            None => break,
+        };
+        let start = offset + rel;
+        let end = start + keyword.len();
+
+        let before_ok = if start == 0 {
+            true
+        } else {
+            prefix[..start]
+                .chars()
+                .next_back()
+                .map(|ch| !ch.is_alphanumeric())
+                .unwrap_or(false)
+        };
+        let after_ok = if end >= prefix.len() {
+            true
+        } else {
+            prefix[end..]
+                .chars()
+                .next()
+                .map(|ch| ch.is_whitespace())
+                .unwrap_or(false)
+        };
+
+        if before_ok && after_ok {
+            found = Some(start);
+        }
+        offset = start + 1;
+    }
+
+    found
+}
+
 fn common_prefix_len(a: &str, b: &str) -> usize {
     let mut len = 0usize;
     for (left, right) in a.chars().zip(b.chars()) {
@@ -221,7 +279,10 @@ fn common_suffix_len(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_output_subdirs, longest_common_prefix_len, longest_common_suffix_len};
+    use super::{
+        derive_output_subdirs, keyword_start_in_prefix, longest_common_prefix_len,
+        longest_common_suffix_len,
+    };
     use crate::cli::{InputPair, InputPath};
     use std::path::PathBuf;
 
@@ -260,6 +321,59 @@ mod tests {
                 Some(PathBuf::from("2")),
                 Some(PathBuf::from("3")),
             ]
+        );
+    }
+
+    #[test]
+    fn derive_subdirs_keeps_cd_token() {
+        let pairs = vec![
+            pair("Artist - Album CD 1"),
+            pair("Artist - Album CD 2"),
+            pair("Artist - Album CD 3"),
+        ];
+        let subdirs = derive_output_subdirs(&pairs).unwrap();
+        assert_eq!(
+            subdirs,
+            vec![
+                Some(PathBuf::from("CD 1")),
+                Some(PathBuf::from("CD 2")),
+                Some(PathBuf::from("CD 3")),
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_subdirs_keeps_disk_token() {
+        let pairs = vec![pair("Artist - Disk 1"), pair("Artist - Disk 2")];
+        let subdirs = derive_output_subdirs(&pairs).unwrap();
+        assert_eq!(
+            subdirs,
+            vec![Some(PathBuf::from("Disk 1")), Some(PathBuf::from("Disk 2"))]
+        );
+    }
+
+    #[test]
+    fn derive_subdirs_keeps_volume_token() {
+        let pairs = vec![pair("Artist - Volume 1"), pair("Artist - Volume 2")];
+        let subdirs = derive_output_subdirs(&pairs).unwrap();
+        assert_eq!(
+            subdirs,
+            vec![
+                Some(PathBuf::from("Volume 1")),
+                Some(PathBuf::from("Volume 2")),
+            ]
+        );
+    }
+
+    #[test]
+    fn keyword_detection_requires_boundary_and_whitespace() {
+        assert_eq!(keyword_start_in_prefix("Artist Scd ", "cd"), None);
+        assert_eq!(keyword_start_in_prefix("Artist - CD  ", "cd"), Some(9));
+        assert_eq!(keyword_start_in_prefix("Artist - CD1 ", "cd"), None);
+        assert_eq!(keyword_start_in_prefix("Artist - Disk 1", "disk"), Some(9));
+        assert_eq!(
+            keyword_start_in_prefix("Artist - Volume 1", "volume"),
+            Some(9)
         );
     }
 }
