@@ -28,6 +28,7 @@ pub(crate) struct SplitOptions {
     pub(crate) picture_path: Option<PathBuf>,
     pub(crate) delete_original: bool,
     pub(crate) rename_original: bool,
+    pub(crate) output_subdir: Option<PathBuf>,
 }
 
 pub(crate) fn split_flac(options: SplitOptions) -> Result<()> {
@@ -36,12 +37,22 @@ pub(crate) fn split_flac(options: SplitOptions) -> Result<()> {
     report_cue_warnings(&warnings);
     validate_cue_files(&cue, &options.flac_input.abs)?;
 
-    let output_dir = options
+    let mut output_dir = options
         .flac_input
         .abs
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+    if let Some(subdir) = options.output_subdir.as_ref() {
+        output_dir = output_dir.join(subdir);
+    }
+    fs::create_dir_all(&output_dir).map_err(|err| {
+        format!(
+            "failed to create output directory {}: {}",
+            output_dir.display(),
+            err
+        )
+    })?;
 
     let mut context = DecodeContext::new(
         cue,

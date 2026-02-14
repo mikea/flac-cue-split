@@ -1,6 +1,6 @@
 # flac-cue-split
 
-Split a single FLAC into per-track FLAC files using a CUE sheet.
+Split FLAC files into per-track FLAC files using matching CUE sheets.
 
 ## Installation
 
@@ -87,8 +87,11 @@ flac-cue-split --cue-encoding windows-1251
 
 ## Behavior
 
-- If `--flac` or `--cue` is not provided, the tool searches the chosen directory for exactly one `.flac` and one `.cue` file. It fails if none or multiple are found.
-- Output files are written next to the input FLAC using the pattern `NN - Title.flac`.
+- If either `--flac` or `--cue` is provided, the tool resolves a single input pair.
+- If neither is provided, the tool scans the chosen directory for `.flac` and `.cue` files.
+- Directory scan mode is valid when `.flac` and `.cue` counts match and every basename has both files (for example: `Disc 1.flac` + `Disc 1.cue`).
+- In multi-file scan mode, each source FLAC is split into a subdirectory. The subdirectory name is derived by removing the longest common prefix and longest common suffix from all FLAC basenames.
+- Output files are written using the pattern `NN - Title.flac`.
 - The tool prints a plan, shared tags, and per-track unique tags, then asks for confirmation.
 - A progress bar is shown during encoding.
 - If `--picture <FILE>` is provided, that file is embedded as the cover image.
