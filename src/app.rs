@@ -90,7 +90,7 @@ pub fn run() -> Result<()> {
                 }
                 return Ok(());
             }
-            ConfirmAction::Cancel => return Ok(()),
+            ConfirmAction::Cancel => return Err("aborted by user".to_string()),
             ConfirmAction::EditSubdirs => {
                 output_subdirs = prompt_output_subdirs(&pairs, &output_subdirs)?;
             }
