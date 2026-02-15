@@ -8,8 +8,8 @@ use crate::Result;
 use crate::cli::{Args, InputPair, resolve_input_pairs};
 use crate::cue::report_cue_warnings;
 use crate::cue::resolve_encoding;
-use crate::ui::{ConfirmAction, confirm_or_exit, print_plan};
 use crate::split::{SplitOptions, prepare_split, sanitize_filename};
+use crate::ui::{ConfirmAction, confirm_or_exit, print_plan};
 
 pub fn run() -> Result<()> {
     let args = Args::parse();

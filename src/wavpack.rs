@@ -120,8 +120,9 @@ impl WavPackHandle {
             flags |= wavpack_bindings::OPEN_TAGS as i32;
         }
 
-        let context =
-            unsafe { wavpack_bindings::WavpackOpenFileInput(path_c.as_ptr(), error.as_mut_ptr(), flags, 0) };
+        let context = unsafe {
+            wavpack_bindings::WavpackOpenFileInput(path_c.as_ptr(), error.as_mut_ptr(), flags, 0)
+        };
         if context.is_null() {
             let err = unsafe { CStr::from_ptr(error.as_ptr()) }
                 .to_string_lossy()
@@ -256,7 +257,12 @@ impl WavPackHandle {
     fn tag_item_value(&self, key: &str) -> Option<String> {
         let key_c = CString::new(key.as_bytes()).ok()?;
         let len = unsafe {
-            wavpack_bindings::WavpackGetTagItem(self.context, key_c.as_ptr(), std::ptr::null_mut(), 0)
+            wavpack_bindings::WavpackGetTagItem(
+                self.context,
+                key_c.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
         };
         if len <= 0 {
             return None;
@@ -280,7 +286,12 @@ impl WavPackHandle {
 
     fn binary_tag_name(&self, index: i32) -> Option<String> {
         let len = unsafe {
-            wavpack_bindings::WavpackGetBinaryTagItemIndexed(self.context, index, std::ptr::null_mut(), 0)
+            wavpack_bindings::WavpackGetBinaryTagItemIndexed(
+                self.context,
+                index,
+                std::ptr::null_mut(),
+                0,
+            )
         };
         if len <= 0 {
             return None;
@@ -305,7 +316,12 @@ impl WavPackHandle {
     fn binary_tag_value(&self, key: &str) -> Option<Vec<u8>> {
         let key_c = CString::new(key.as_bytes()).ok()?;
         let len = unsafe {
-            wavpack_bindings::WavpackGetBinaryTagItem(self.context, key_c.as_ptr(), std::ptr::null_mut(), 0)
+            wavpack_bindings::WavpackGetBinaryTagItem(
+                self.context,
+                key_c.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
         };
         if len <= 0 {
             return None;

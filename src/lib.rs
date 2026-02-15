@@ -6,10 +6,10 @@ mod cue;
 mod decoder;
 mod flac;
 mod metadata;
-mod ui;
 mod picture;
 mod split;
 mod types;
+mod ui;
 mod wavpack;
 
 pub use app::run;
