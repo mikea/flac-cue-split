@@ -250,10 +250,12 @@ pub(crate) fn parse_vorbis_comment(
 
     vendor = parse_vorbis_entry(&vc.vendor_string);
 
-    let entries = unsafe { std::slice::from_raw_parts(vc.comments, vc.num_comments as usize) };
-    for entry in entries {
-        if let Some((key, value)) = parse_vorbis_kv(entry) {
-            comments.push((key, value));
+    if vc.num_comments > 0 && !vc.comments.is_null() {
+        let entries = unsafe { std::slice::from_raw_parts(vc.comments, vc.num_comments as usize) };
+        for entry in entries {
+            if let Some((key, value)) = parse_vorbis_kv(entry) {
+                comments.push((key, value));
+            }
         }
     }
 
