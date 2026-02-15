@@ -207,7 +207,7 @@ pub(crate) fn confirm_or_exit(yes: bool, allow_subdirs_edit: bool) -> Result<Con
     }
 
     if allow_subdirs_edit {
-        print!("Proceed? [y/N/{}ubdirs]: ", "S".yellow().bold());
+        print!("Proceed? [y/{}ubdirs/N]: ", "s".yellow().bold());
     } else {
         print!("Proceed? [y/N]: ");
     }
