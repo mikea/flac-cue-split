@@ -1,4 +1,5 @@
 use clap::Parser;
+use dialoguer::Input;
 use owo_colors::OwoColorize;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -7,7 +8,7 @@ use crate::Result;
 use crate::cli::{Args, InputPair, resolve_input_pairs};
 use crate::cue::report_cue_warnings;
 use crate::cue::resolve_encoding;
-use crate::output::{confirm_or_exit, print_plan};
+use crate::ui::{ConfirmAction, confirm_or_exit, print_plan};
 use crate::split::{SplitOptions, prepare_split, sanitize_filename};
 
 pub fn run() -> Result<()> {
@@ -47,50 +48,104 @@ pub fn run() -> Result<()> {
         args.cue.as_ref(),
     )?;
 
-    let output_subdirs = derive_output_subdirs(&pairs)?;
+    let mut output_subdirs = derive_output_subdirs(&pairs)?;
     let total = pairs.len();
     let enforce_cue_filename_match = total > 1;
-    let mut prepared_jobs = Vec::with_capacity(total);
-
-    for (pair, output_subdir) in pairs.into_iter().zip(output_subdirs.into_iter()) {
-        let prepared = prepare_split(SplitOptions {
-            flac_input: pair.flac,
-            cue_input: pair.cue,
-            display_base_abs: display_base_abs.clone(),
-            cue_encoding: encoding,
-            overwrite: args.overwrite,
-            compression_level: args.compression_level,
-            search_dir: base_dir_abs.clone(),
-            picture_enabled,
-            picture_path: picture_path.clone(),
-            delete_original: args.delete_original,
-            rename_original: args.rename_original,
-            output_subdir,
-            enforce_cue_filename_match,
-        })?;
-        prepared_jobs.push(prepared);
-    }
-
-    for (index, prepared) in prepared_jobs.iter().enumerate() {
-        if total > 1 {
-            if index > 0 {
-                println!();
-            }
-            println!("{}", format!("Pair {}/{}", index + 1, total).bold().blue());
+    loop {
+        let mut prepared_jobs = Vec::with_capacity(total);
+        for (pair, output_subdir) in pairs.iter().cloned().zip(output_subdirs.iter().cloned()) {
+            let prepared = prepare_split(SplitOptions {
+                flac_input: pair.flac,
+                cue_input: pair.cue,
+                display_base_abs: display_base_abs.clone(),
+                cue_encoding: encoding,
+                overwrite: args.overwrite,
+                compression_level: args.compression_level,
+                search_dir: base_dir_abs.clone(),
+                picture_enabled,
+                picture_path: picture_path.clone(),
+                delete_original: args.delete_original,
+                rename_original: args.rename_original,
+                output_subdir,
+                enforce_cue_filename_match,
+            })?;
+            prepared_jobs.push(prepared);
         }
-        report_cue_warnings(prepared.warnings());
-        print_plan(prepared)?;
+
+        for (index, prepared) in prepared_jobs.iter().enumerate() {
+            if total > 1 {
+                if index > 0 {
+                    println!();
+                }
+                println!("{}", format!("Pair {}/{}", index + 1, total).bold().blue());
+            }
+            report_cue_warnings(prepared.warnings());
+            print_plan(prepared)?;
+        }
+
+        match confirm_or_exit(args.yes, total > 1)? {
+            ConfirmAction::Proceed => {
+                for prepared in prepared_jobs {
+                    prepared.execute()?;
+                }
+                return Ok(());
+            }
+            ConfirmAction::Cancel => return Ok(()),
+            ConfirmAction::EditSubdirs => {
+                output_subdirs = prompt_output_subdirs(&pairs, &output_subdirs)?;
+            }
+        }
+    }
+}
+
+fn prompt_output_subdirs(
+    pairs: &[InputPair],
+    current_subdirs: &[Option<PathBuf>],
+) -> Result<Vec<Option<PathBuf>>> {
+    println!();
+    println!("{}", "Configure output subdirectories".bold());
+
+    let mut seen = HashSet::new();
+    let mut edited = Vec::with_capacity(pairs.len());
+
+    for (index, pair) in pairs.iter().enumerate() {
+        let default_subdir = current_subdirs
+            .get(index)
+            .and_then(|value| value.as_ref())
+            .map(|value| value.to_string_lossy().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("missing derived output subdirectory for pair {}", index + 1))?;
+
+        println!("{} {}", "Pair:".cyan(), pair_name(pair).bold());
+
+        let edited_subdir: String = Input::new()
+            .with_prompt("Subdir")
+            .with_initial_text(default_subdir)
+            .interact_text()
+            .map_err(|err| format!("failed to read subdir name: {}", err))?;
+
+        let normalized = sanitize_filename(edited_subdir.trim());
+        if normalized.is_empty() {
+            return Err("subdir name cannot be empty".to_string());
+        }
+        if !seen.insert(normalized.clone()) {
+            return Err(format!(
+                "duplicate output subdirectory name: {}",
+                normalized
+            ));
+        }
+        edited.push(Some(PathBuf::from(normalized)));
     }
 
-    if !confirm_or_exit(args.yes)? {
-        return Ok(());
-    }
+    Ok(edited)
+}
 
-    for prepared in prepared_jobs {
-        prepared.execute()?;
-    }
-
-    Ok(())
+fn pair_name(pair: &InputPair) -> String {
+    pair.flac
+        .display
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| pair.flac.display.display().to_string())
 }
 
 fn derive_output_subdirs(pairs: &[InputPair]) -> Result<Vec<Option<PathBuf>>> {

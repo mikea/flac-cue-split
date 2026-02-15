@@ -1,11 +1,12 @@
 [package]
 name = "flac-cue-split"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 cue-sys = "2"
+dialoguer = "0.11"
 encoding_rs = "0"
 indicatif = "0"
 libc = "0"

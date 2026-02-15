@@ -96,7 +96,8 @@ flac-cue-split --cue-encoding windows-1251
 - Directory scan mode is valid when audio-image (`.flac` or `.wv`) and `.cue` counts match and every basename has both files (for example: `Disc 1.wv` + `Disc 1.cue`).
 - When there are several pairs, each source image is split into a subdirectory. The subdirectory name is derived by removing the longest common prefix and longest common suffix from all source basenames.
 - Output files are written using the pattern `NN - Title.flac`.
-- The tool prints a preview plan for all pairs (including shared tags and per-track unique tags), then asks for one batch confirmation.
+- The tool prints a preview plan for all pairs (including shared tags and per-track unique tags), then asks for one batch confirmation (`y/N`).
+- In multi-pair mode, the confirmation prompt also supports `S` (`Subdirs`) to interactively edit per-pair output subdirectory names before running.
 - A progress bar is shown during encoding.
 - If `--picture <FILE>` is provided, that file is embedded as the cover image.
 - Otherwise, if there is exactly one image file in the chosen directory (jpg/jpeg/png/gif/bmp/webp/tif/tiff), it is embedded as a cover picture in all output files (unless `--no-picture` is used).

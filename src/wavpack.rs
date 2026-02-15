@@ -8,8 +8,7 @@ use crate::flac::FlacMetadata;
 use crate::picture::build_picture_metadata_from_data;
 use crate::types::InputMetadata;
 
-#[allow(non_snake_case)]
-mod wavpack {
+mod wavpack_bindings {
     #![allow(
         dead_code,
         non_camel_case_types,
@@ -107,7 +106,7 @@ struct EmbeddedPicture {
 }
 
 struct WavPackHandle {
-    context: *mut wavpack::WavpackContext,
+    context: *mut wavpack_bindings::WavpackContext,
 }
 
 impl WavPackHandle {
@@ -118,11 +117,11 @@ impl WavPackHandle {
         let mut error = [0i8; 81];
         let mut flags = 0i32;
         if with_tags {
-            flags |= wavpack::OPEN_TAGS as i32;
+            flags |= wavpack_bindings::OPEN_TAGS as i32;
         }
 
         let context =
-            unsafe { wavpack::WavpackOpenFileInput(path_c.as_ptr(), error.as_mut_ptr(), flags, 0) };
+            unsafe { wavpack_bindings::WavpackOpenFileInput(path_c.as_ptr(), error.as_mut_ptr(), flags, 0) };
         if context.is_null() {
             let err = unsafe { CStr::from_ptr(error.as_ptr()) }
                 .to_string_lossy()
@@ -142,23 +141,23 @@ impl WavPackHandle {
     }
 
     fn sample_rate(&self) -> u32 {
-        unsafe { wavpack::WavpackGetSampleRate(self.context) as u32 }
+        unsafe { wavpack_bindings::WavpackGetSampleRate(self.context) as u32 }
     }
 
     fn channels(&self) -> u32 {
-        unsafe { wavpack::WavpackGetNumChannels(self.context) as u32 }
+        unsafe { wavpack_bindings::WavpackGetNumChannels(self.context) as u32 }
     }
 
     fn bits_per_sample(&self) -> u32 {
-        unsafe { wavpack::WavpackGetBitsPerSample(self.context) as u32 }
+        unsafe { wavpack_bindings::WavpackGetBitsPerSample(self.context) as u32 }
     }
 
     fn total_samples(&self) -> u64 {
-        unsafe { wavpack::WavpackGetNumSamples64(self.context) as u64 }
+        unsafe { wavpack_bindings::WavpackGetNumSamples64(self.context) as u64 }
     }
 
     fn sample_index(&self) -> u64 {
-        unsafe { wavpack::WavpackGetSampleIndex64(self.context) as u64 }
+        unsafe { wavpack_bindings::WavpackGetSampleIndex64(self.context) as u64 }
     }
 
     fn unpack_samples(&self, interleaved: &mut [i32], channels: usize) -> Result<usize> {
@@ -171,7 +170,7 @@ impl WavPackHandle {
         }
 
         let samples = unsafe {
-            wavpack::WavpackUnpackSamples(
+            wavpack_bindings::WavpackUnpackSamples(
                 self.context,
                 interleaved.as_mut_ptr(),
                 max_samples as u32,
@@ -182,7 +181,7 @@ impl WavPackHandle {
 
     fn read_text_tags(&self) -> Vec<(String, String)> {
         let mut tags = Vec::new();
-        let count = unsafe { wavpack::WavpackGetNumTagItems(self.context) };
+        let count = unsafe { wavpack_bindings::WavpackGetNumTagItems(self.context) };
         if count <= 0 {
             return tags;
         }
@@ -202,7 +201,7 @@ impl WavPackHandle {
 
     fn read_picture_tags(&self) -> Result<Vec<EmbeddedPicture>> {
         let mut pictures = Vec::new();
-        let count = unsafe { wavpack::WavpackGetNumBinaryTagItems(self.context) };
+        let count = unsafe { wavpack_bindings::WavpackGetNumBinaryTagItems(self.context) };
         if count <= 0 {
             return Ok(pictures);
         }
@@ -232,7 +231,7 @@ impl WavPackHandle {
 
     fn tag_item_name(&self, index: i32) -> Option<String> {
         let len = unsafe {
-            wavpack::WavpackGetTagItemIndexed(self.context, index, std::ptr::null_mut(), 0)
+            wavpack_bindings::WavpackGetTagItemIndexed(self.context, index, std::ptr::null_mut(), 0)
         };
         if len <= 0 {
             return None;
@@ -240,7 +239,7 @@ impl WavPackHandle {
 
         let mut key = vec![0u8; len as usize + 1];
         let written = unsafe {
-            wavpack::WavpackGetTagItemIndexed(
+            wavpack_bindings::WavpackGetTagItemIndexed(
                 self.context,
                 index,
                 key.as_mut_ptr().cast::<c_char>(),
@@ -257,7 +256,7 @@ impl WavPackHandle {
     fn tag_item_value(&self, key: &str) -> Option<String> {
         let key_c = CString::new(key.as_bytes()).ok()?;
         let len = unsafe {
-            wavpack::WavpackGetTagItem(self.context, key_c.as_ptr(), std::ptr::null_mut(), 0)
+            wavpack_bindings::WavpackGetTagItem(self.context, key_c.as_ptr(), std::ptr::null_mut(), 0)
         };
         if len <= 0 {
             return None;
@@ -265,7 +264,7 @@ impl WavPackHandle {
 
         let mut value = vec![0u8; len as usize + 1];
         let written = unsafe {
-            wavpack::WavpackGetTagItem(
+            wavpack_bindings::WavpackGetTagItem(
                 self.context,
                 key_c.as_ptr(),
                 value.as_mut_ptr().cast::<c_char>(),
@@ -281,7 +280,7 @@ impl WavPackHandle {
 
     fn binary_tag_name(&self, index: i32) -> Option<String> {
         let len = unsafe {
-            wavpack::WavpackGetBinaryTagItemIndexed(self.context, index, std::ptr::null_mut(), 0)
+            wavpack_bindings::WavpackGetBinaryTagItemIndexed(self.context, index, std::ptr::null_mut(), 0)
         };
         if len <= 0 {
             return None;
@@ -289,7 +288,7 @@ impl WavPackHandle {
 
         let mut key = vec![0u8; len as usize + 1];
         let written = unsafe {
-            wavpack::WavpackGetBinaryTagItemIndexed(
+            wavpack_bindings::WavpackGetBinaryTagItemIndexed(
                 self.context,
                 index,
                 key.as_mut_ptr().cast::<c_char>(),
@@ -306,7 +305,7 @@ impl WavPackHandle {
     fn binary_tag_value(&self, key: &str) -> Option<Vec<u8>> {
         let key_c = CString::new(key.as_bytes()).ok()?;
         let len = unsafe {
-            wavpack::WavpackGetBinaryTagItem(self.context, key_c.as_ptr(), std::ptr::null_mut(), 0)
+            wavpack_bindings::WavpackGetBinaryTagItem(self.context, key_c.as_ptr(), std::ptr::null_mut(), 0)
         };
         if len <= 0 {
             return None;
@@ -314,7 +313,7 @@ impl WavPackHandle {
 
         let mut value = vec![0u8; len as usize];
         let written = unsafe {
-            wavpack::WavpackGetBinaryTagItem(
+            wavpack_bindings::WavpackGetBinaryTagItem(
                 self.context,
                 key_c.as_ptr(),
                 value.as_mut_ptr().cast::<c_char>(),
@@ -332,7 +331,7 @@ impl WavPackHandle {
 impl Drop for WavPackHandle {
     fn drop(&mut self) {
         unsafe {
-            wavpack::WavpackCloseFile(self.context);
+            wavpack_bindings::WavpackCloseFile(self.context);
         }
     }
 }

@@ -31,11 +31,13 @@ pub(crate) struct Args {
     pub(crate) rename_original: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct InputPath {
     pub(crate) abs: PathBuf,
     pub(crate) display: PathBuf,
 }
 
+#[derive(Clone)]
 pub(crate) struct InputPair {
     pub(crate) flac: InputPath,
     pub(crate) cue: InputPath,

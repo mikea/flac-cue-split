@@ -10,7 +10,7 @@ use crate::cli::{InputPath, display_path};
 use crate::cue::parse_cue_file;
 use crate::decoder::{AudioBlock, create_decoder};
 use crate::flac::{TrackEncoder, start_track_encoder};
-use crate::output::{finish_progress, make_progress_bar};
+use crate::ui::{finish_progress, make_progress_bar};
 use crate::picture::add_external_picture;
 use crate::types::{CueDisc, CueRem, InputMetadata, TrackSpan};
 

@@ -6,7 +6,7 @@ mod cue;
 mod decoder;
 mod flac;
 mod metadata;
-mod output;
+mod ui;
 mod picture;
 mod split;
 mod types;

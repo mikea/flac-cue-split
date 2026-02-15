@@ -9,6 +9,12 @@ use crate::metadata::{compute_common_metadata, compute_unique_metadata_pairs};
 use crate::split::{Plan, processed_flac_path};
 use crate::types::{CueDisc, InputMetadata, TrackSpan};
 
+pub(crate) enum ConfirmAction {
+    Proceed,
+    Cancel,
+    EditSubdirs,
+}
+
 pub(crate) fn print_plan(plan: &Plan) -> Result<()> {
     let cue: &CueDisc = plan.cue();
     let meta: &InputMetadata = plan.input_meta();
@@ -195,12 +201,16 @@ pub(crate) fn finish_progress(progress: &mut Option<ProgressBar>, message: &str)
     }
 }
 
-pub(crate) fn confirm_or_exit(yes: bool) -> Result<bool> {
+pub(crate) fn confirm_or_exit(yes: bool, allow_subdirs_edit: bool) -> Result<ConfirmAction> {
     if yes {
-        return Ok(true);
+        return Ok(ConfirmAction::Proceed);
     }
 
-    print!("Proceed? [y/N]: ");
+    if allow_subdirs_edit {
+        print!("Proceed? [y/N/S]: ");
+    } else {
+        print!("Proceed? [y/N]: ");
+    }
     io::stdout()
         .flush()
         .map_err(|err| format!("failed to flush stdout: {}", err))?;
@@ -210,8 +220,18 @@ pub(crate) fn confirm_or_exit(yes: bool) -> Result<bool> {
         .read_line(&mut input)
         .map_err(|err| format!("failed to read confirmation: {}", err))?;
 
+    Ok(parse_confirm_action(&input, allow_subdirs_edit))
+}
+
+fn parse_confirm_action(input: &str, allow_subdirs_edit: bool) -> ConfirmAction {
     let answer = input.trim().to_ascii_lowercase();
-    Ok(answer == "y" || answer == "yes")
+    if answer == "y" || answer == "yes" {
+        return ConfirmAction::Proceed;
+    }
+    if allow_subdirs_edit && (answer == "s" || answer == "subdirs") {
+        return ConfirmAction::EditSubdirs;
+    }
+    ConfirmAction::Cancel
 }
 
 pub(crate) fn format_msf(frames: u64) -> String {
@@ -220,4 +240,49 @@ pub(crate) fn format_msf(frames: u64) -> String {
     let seconds = total_seconds % 60;
     let frames = frames % 75;
     format!("{:02}:{:02}:{:02}", minutes, seconds, frames)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfirmAction, parse_confirm_action};
+
+    #[test]
+    fn parse_confirm_action_accepts_yes() {
+        assert!(matches!(
+            parse_confirm_action("y", false),
+            ConfirmAction::Proceed
+        ));
+        assert!(matches!(
+            parse_confirm_action("YES", true),
+            ConfirmAction::Proceed
+        ));
+    }
+
+    #[test]
+    fn parse_confirm_action_handles_subdirs_option() {
+        assert!(matches!(
+            parse_confirm_action("s", true),
+            ConfirmAction::EditSubdirs
+        ));
+        assert!(matches!(
+            parse_confirm_action("subdirs", true),
+            ConfirmAction::EditSubdirs
+        ));
+        assert!(matches!(
+            parse_confirm_action("s", false),
+            ConfirmAction::Cancel
+        ));
+    }
+
+    #[test]
+    fn parse_confirm_action_defaults_to_cancel() {
+        assert!(matches!(
+            parse_confirm_action("", true),
+            ConfirmAction::Cancel
+        ));
+        assert!(matches!(
+            parse_confirm_action("n", false),
+            ConfirmAction::Cancel
+        ));
+    }
 }
