@@ -313,7 +313,20 @@ pub(crate) fn resolve_matching_pairs(
         });
     }
 
+    sort_pairs_by_audio_file_name(&mut pairs);
     Ok(pairs)
+}
+
+fn sort_pairs_by_audio_file_name(pairs: &mut [InputPair]) {
+    pairs.sort_by_cached_key(|pair| {
+        let file_name = pair
+            .flac
+            .abs
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| pair.flac.abs.to_string_lossy().into_owned());
+        (file_name.to_ascii_lowercase(), file_name)
+    });
 }
 
 pub(crate) fn resolve_input_pairs(
@@ -409,7 +422,10 @@ fn strip_known_audio_suffix(stem: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_input_pairs, strip_known_audio_suffix};
+    use super::{
+        InputPair, InputPath, resolve_input_pairs, sort_pairs_by_audio_file_name,
+        strip_known_audio_suffix,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -463,6 +479,43 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sort_pairs_uses_full_audio_filename_order() {
+        let mut pairs = vec![
+            InputPair {
+                flac: InputPath {
+                    abs: PathBuf::from("A.wv"),
+                    display: PathBuf::from("A.wv"),
+                },
+                cue: InputPath {
+                    abs: PathBuf::from("A.cue"),
+                    display: PathBuf::from("A.cue"),
+                },
+            },
+            InputPair {
+                flac: InputPath {
+                    abs: PathBuf::from("A 2.flac"),
+                    display: PathBuf::from("A 2.flac"),
+                },
+                cue: InputPath {
+                    abs: PathBuf::from("A 2.cue"),
+                    display: PathBuf::from("A 2.cue"),
+                },
+            },
+        ];
+
+        sort_pairs_by_audio_file_name(&mut pairs);
+
+        assert_eq!(
+            pairs[0].flac.abs.file_name().unwrap().to_string_lossy(),
+            "A 2.flac"
+        );
+        assert_eq!(
+            pairs[1].flac.abs.file_name().unwrap().to_string_lossy(),
+            "A.wv"
+        );
     }
 
     fn unique_test_dir() -> PathBuf {

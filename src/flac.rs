@@ -81,7 +81,7 @@ impl FlacDecoder {
 
         decoder.init_file(
             &self.path,
-            None,
+            Some(flac_noop_write_callback),
             Some(flac_metadata_callback),
             Some(flac_metadata_error_callback),
             state.as_mut() as *mut _ as *mut c_void,
@@ -174,8 +174,13 @@ impl FlacStreamDecoder {
         };
         if init_status != flac::FLAC__STREAM_DECODER_INIT_STATUS_OK {
             return Err(format!(
-                "failed to init FLAC decoder (status {})",
-                init_status
+                "failed to init FLAC decoder for {} (status {}: {}; write_cb={}, metadata_cb={}, error_cb={})",
+                path.display(),
+                init_status,
+                decoder_init_status_label(init_status),
+                write_cb.is_some(),
+                metadata_cb.is_some(),
+                error_cb.is_some(),
             ));
         }
         Ok(())
@@ -263,7 +268,11 @@ unsafe extern "C" fn flac_metadata_error_callback(
         return;
     }
     let state = unsafe { &mut *(client_data as *mut FlacMetadataState) };
-    state.error = Some(format!("FLAC decoder error status {}", status));
+    state.error = Some(format!(
+        "FLAC decoder error status {} ({})",
+        status,
+        decoder_error_status_label(status)
+    ));
 }
 
 struct FlacBlockState {
@@ -358,7 +367,20 @@ unsafe extern "C" fn flac_stream_error_callback(
         return;
     }
     let state = unsafe { &mut *(client_data as *mut FlacBlockState) };
-    state.error = Some(format!("FLAC decoder error status {}", status));
+    state.error = Some(format!(
+        "FLAC decoder error status {} ({})",
+        status,
+        decoder_error_status_label(status)
+    ));
+}
+
+unsafe extern "C" fn flac_noop_write_callback(
+    _decoder: *const flac::FLAC__StreamDecoder,
+    _frame: *const flac::FLAC__Frame,
+    _buffer: *const *const i32,
+    _client_data: *mut c_void,
+) -> flac::FLAC__StreamDecoderWriteStatus {
+    flac::FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE
 }
 
 unsafe extern "C" fn flac_write_callback(
@@ -552,5 +574,27 @@ fn announce_track_start(
         progress.println(line);
     } else {
         println!("{}", line);
+    }
+}
+
+fn decoder_init_status_label(status: flac::FLAC__StreamDecoderInitStatus) -> &'static str {
+    match status {
+        flac::FLAC__STREAM_DECODER_INIT_STATUS_OK => "OK",
+        flac::FLAC__STREAM_DECODER_INIT_STATUS_UNSUPPORTED_CONTAINER => "UNSUPPORTED_CONTAINER",
+        flac::FLAC__STREAM_DECODER_INIT_STATUS_INVALID_CALLBACKS => "INVALID_CALLBACKS",
+        flac::FLAC__STREAM_DECODER_INIT_STATUS_MEMORY_ALLOCATION_ERROR => "MEMORY_ALLOCATION_ERROR",
+        flac::FLAC__STREAM_DECODER_INIT_STATUS_ERROR_OPENING_FILE => "ERROR_OPENING_FILE",
+        flac::FLAC__STREAM_DECODER_INIT_STATUS_ALREADY_INITIALIZED => "ALREADY_INITIALIZED",
+        _ => "UNKNOWN",
+    }
+}
+
+fn decoder_error_status_label(status: flac::FLAC__StreamDecoderErrorStatus) -> &'static str {
+    match status {
+        flac::FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC => "LOST_SYNC",
+        flac::FLAC__STREAM_DECODER_ERROR_STATUS_BAD_HEADER => "BAD_HEADER",
+        flac::FLAC__STREAM_DECODER_ERROR_STATUS_FRAME_CRC_MISMATCH => "FRAME_CRC_MISMATCH",
+        flac::FLAC__STREAM_DECODER_ERROR_STATUS_UNPARSEABLE_STREAM => "UNPARSEABLE_STREAM",
+        _ => "UNKNOWN",
     }
 }
